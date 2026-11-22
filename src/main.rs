@@ -1239,14 +1239,11 @@ fn parse_clicks(c: &Chunk, ctx: &Ctx, links: &Links) -> Vec<Vec<UCk>> {
 
 // ---------------------------------------------------------------- sessions
 
-#[derive(Clone, Copy, Default)]
-struct E2 {
-    /// ms relative to window_start.
-    ts: u32,
-    price: u32,
-    cat: u16,
-    kind: u8,
-}
+/// A person's event for sessionizing, as one sortable u64: ts (ms relative
+/// to window_start) in the high half; the low half is 0, or for a purchase
+/// 1 + its index in the partition's purchase table (price, category). Only
+/// purchases need more than the ts, and they are about 3% of events.
+type E2 = u64;
 
 #[derive(Clone, Copy)]
 struct C2 {
@@ -1312,7 +1309,7 @@ fn flush_day(name: S, day: i64, ur: &mut [i64; 3], cats: &mut Vec<(u16, i64)>, r
 }
 
 #[allow(clippy::too_many_arguments)]
-fn person(name: S, es: &[E2], cs: &[C2], ctx: &Ctx, rank: &[u32], acc: &mut CampAcc, rows: &mut Vec<URow>, sc: &mut Scratch) {
+fn person(name: S, es: &[E2], pur: &[(u32, u16)], cs: &[C2], ctx: &Ctx, rank: &[u32], acc: &mut CampAcc, rows: &mut Vec<URow>, sc: &mut Scratch) {
     let organic = ctx.ncamp;
     sc.starts.clear();
     sc.dayis.clear();
@@ -1323,7 +1320,7 @@ fn person(name: S, es: &[E2], cs: &[C2], ctx: &Ctx, rank: &[u32], acc: &mut Camp
     let n = es.len();
     let ws = ctx.ws;
     while i < n {
-        let start = ws + es[i].ts as i64;
+        let start = ws + (es[i] >> 32) as i64;
         let day = start.div_euclid(DAY);
         if day != cur_day {
             if cur_day != i64::MIN {
@@ -1336,16 +1333,17 @@ fn person(name: S, es: &[E2], cs: &[C2], ctx: &Ctx, rank: &[u32], acc: &mut Camp
         let mut rev = 0i64;
         let mut purch = false;
         // Gap over 30 min starts a new session; equal timestamps share one.
-        while i < n && ws + es[i].ts as i64 - last <= GAP {
+        while i < n && ws + (es[i] >> 32) as i64 - last <= GAP {
             let e = es[i];
-            last = ws + e.ts as i64;
+            last = ws + (e >> 32) as i64;
             nev += 1;
-            if e.kind == K_PURCHASE {
+            if e as u32 != 0 {
+                let (price, cat) = pur[e as u32 as usize - 1];
                 purch = true;
-                rev += e.price as i64;
-                match sc.cats.iter_mut().find(|x| x.0 == e.cat) {
-                    Some(x) => x.1 += e.price as i64,
-                    None => sc.cats.push((e.cat, e.price as i64)),
+                rev += price as i64;
+                match sc.cats.iter_mut().find(|x| x.0 == cat) {
+                    Some(x) => x.1 += price as i64,
+                    None => sc.cats.push((cat, price as i64)),
                 }
             }
             i += 1;
@@ -1431,6 +1429,7 @@ fn process_partition(part: usize, evs: Vec<Vec<UEv>>, cks: Vec<Vec<UCk>>, ctx: &
     // (local person id, event) in arrival order: the fill below then reads one
     // compact sequential array instead of the routed records again.
     let mut tmp: Vec<(u32, E2)> = Vec::with_capacity(n);
+    let mut pur: Vec<(u32, u16)> = Vec::new();
     let mut last: (U, u32) = (U(u64::MAX), u32::MAX);
     for v in &evs {
         for e in v {
@@ -1462,7 +1461,13 @@ fn process_partition(part: usize, evs: Vec<Vec<UEv>>, cks: Vec<Vec<UCk>>, ctx: &
                 id
             };
             cnt[id as usize] += 1;
-            tmp.push((id, E2 { ts: e.ts, price: e.price, cat: e.cat, kind: e.kind }));
+            let low = if e.kind == K_PURCHASE {
+                pur.push((e.price, e.cat));
+                pur.len() as u64
+            } else {
+                0
+            };
+            tmp.push((id, (e.ts as u64) << 32 | low));
         }
     }
     prof(8, t);
@@ -1475,7 +1480,7 @@ fn process_partition(part: usize, evs: Vec<Vec<UEv>>, cks: Vec<Vec<UCk>>, ctx: &
     drop(cnt);
     let mut pos = off.clone();
     drop(evs);
-    let mut arr = vec![E2::default(); n];
+    let mut arr: Vec<E2> = vec![0; n];
     for &(id, e) in &tmp {
         let id = id as usize;
         arr[pos[id] as usize] = e;
@@ -1526,7 +1531,7 @@ fn process_partition(part: usize, evs: Vec<Vec<UEv>>, cks: Vec<Vec<UCk>>, ctx: &
     prof(5, t);
     let t = Instant::now();
     for p in 0..np {
-        arr[off[p] as usize..off[p + 1] as usize].sort_unstable_by_key(|e| e.ts);
+        arr[off[p] as usize..off[p + 1] as usize].sort_unstable();
         carr[coff[p] as usize..coff[p + 1] as usize]
             .sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.cid.get().cmp(b.cid.get())));
     }
@@ -1536,7 +1541,7 @@ fn process_partition(part: usize, evs: Vec<Vec<UEv>>, cks: Vec<Vec<UCk>>, ctx: &
     for p in 0..np {
         let es = &arr[off[p] as usize..off[p + 1] as usize];
         let cs = &carr[coff[p] as usize..coff[p + 1] as usize];
-        person(names[p], es, cs, ctx, rank, acc, &mut rows, &mut sc);
+        person(names[p], es, &pur, cs, ctx, rank, acc, &mut rows, &mut sc);
     }
     prof(7, t);
     rows
@@ -1910,4 +1915,4 @@ const _: () = assert!(std::mem::size_of::<C2>() == 24);
 const _: () = assert!(std::mem::size_of::<Ev>() == 32);
 const _: () = assert!(std::mem::size_of::<DE>() == 16);
 const _: () = assert!(std::mem::size_of::<UEv>() == 32);
-const _: () = assert!(std::mem::size_of::<E2>() == 12);
+const _: () = assert!(std::mem::size_of::<E2>() == 8);
