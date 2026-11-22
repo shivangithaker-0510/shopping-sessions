@@ -1308,6 +1308,7 @@ fn main() {
     let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("read manifest.json");
     let ws = manifest_ts(&manifest, "window_start");
     let we = manifest_ts(&manifest, "window_end");
+    parse::init_dates(ws);
     log!(t0, "window {ws}..{we}, {threads} threads");
 
     // Map every input file (readahead starts immediately).
