@@ -141,14 +141,14 @@ macro_rules! log {
 
 /// Experiment switch (SS_EXP), for local profiling only.
 static EXP: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-static PROF: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
-const PROF_NAMES: [&str; 8] = ["links", "parse_ev", "dedup", "parse_ck", "dedup_tab", "group", "sort", "person"];
+static PROF: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+const PROF_NAMES: [&str; 11] = ["links", "parse_ev", "dedup", "parse_ck", "dedup_tab", "group", "sort", "person", "g_ids", "g_fill", "g_clicks"];
 #[inline]
 fn prof(i: usize, t: Instant) {
     PROF[i].fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
 }
 fn prof_report() -> String {
-    (0..8)
+    (0..PROF_NAMES.len())
         .map(|i| format!("{}={:.2}", PROF_NAMES[i], PROF[i].load(Relaxed) as f64 / 1e9))
         .collect::<Vec<_>>()
         .join(" ")
@@ -1194,7 +1194,9 @@ fn process_partition(part: usize, evs: Vec<Vec<UEv>>, cks: Vec<Vec<UCk>>, ctx: &
     let mut ukeys: Vec<K> = Vec::new();
     let mut cnt: Vec<u32> = Vec::new();
     let mut table: HashTable<u32> = HashTable::with_capacity(n / 8 + 16);
-    let mut pid: Vec<u32> = Vec::with_capacity(n);
+    // (local person id, event) in arrival order: the fill below then reads one
+    // compact sequential array instead of the routed records again.
+    let mut tmp: Vec<(u32, E2)> = Vec::with_capacity(n);
     let mut last: (K, u32) = (K(u64::MAX, u64::MAX), u32::MAX);
     for v in &evs {
         for e in v {
@@ -1226,9 +1228,11 @@ fn process_partition(part: usize, evs: Vec<Vec<UEv>>, cks: Vec<Vec<UCk>>, ctx: &
                 id
             };
             cnt[id as usize] += 1;
-            pid.push(id);
+            tmp.push((id, E2 { ts: e.ts, price: e.price, cat: e.cat, kind: e.kind }));
         }
     }
+    prof(8, t);
+    let tf = Instant::now();
     let np = names.len();
     let mut off = vec![0u32; np + 1];
     for p in 0..np {
@@ -1236,17 +1240,16 @@ fn process_partition(part: usize, evs: Vec<Vec<UEv>>, cks: Vec<Vec<UCk>>, ctx: &
     }
     drop(cnt);
     let mut pos = off.clone();
+    drop(evs);
     let mut arr = vec![E2::default(); n];
-    let mut k = 0;
-    for v in evs {
-        for e in v {
-            let id = pid[k] as usize;
-            k += 1;
-            arr[pos[id] as usize] = E2 { ts: e.ts, price: e.price, cat: e.cat, kind: e.kind };
-            pos[id] += 1;
-        }
+    for &(id, e) in &tmp {
+        let id = id as usize;
+        arr[pos[id] as usize] = e;
+        pos[id] += 1;
     }
-    drop(pid);
+    drop(tmp);
+    prof(9, tf);
+    let tf = Instant::now();
     // Clicks of people with events (other clicks can credit nothing).
     let mut ccnt = vec![0u32; np];
     let mut cpid: Vec<u32> = Vec::new();
@@ -1285,6 +1288,7 @@ fn process_partition(part: usize, evs: Vec<Vec<UEv>>, cks: Vec<Vec<UCk>>, ctx: &
             }
         }
     }
+    prof(10, tf);
     prof(5, t);
     let t = Instant::now();
     for p in 0..np {
