@@ -33,7 +33,7 @@ use memchr::memchr;
 use parse::*;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::Relaxed};
 use std::time::Instant;
 use xxhash_rust::xxh3::xxh3_128;
 
@@ -338,10 +338,200 @@ impl Iterator for Structurals<'_> {
     }
 }
 
+/// Which SIMD width builds the byte-class masks: 0 SSE2, 1 AVX2, 2 AVX-512BW.
+/// SSE2 unless `SS_ISA` asks for more (capped by what the CPU has): the
+/// masks are a small part of the scan, and wider ones measured no faster.
+static ISA: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(target_arch = "x86_64")]
+fn pick_isa() -> u8 {
+    let best = if cfg!(feature = "avx512") && std::is_x86_feature_detected!("avx512bw") {
+        2
+    } else if std::is_x86_feature_detected!("avx2") {
+        1
+    } else {
+        0
+    };
+    let want = std::env::var("SS_ISA").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    want.min(best)
+}
+
+/// The largest ISA level this CPU supports (for the tests).
+#[cfg(all(test, target_arch = "x86_64"))]
+fn max_isa() -> u8 {
+    if cfg!(feature = "avx512") && std::is_x86_feature_detected!("avx512bw") {
+        2
+    } else if std::is_x86_feature_detected!("avx2") {
+        1
+    } else {
+        0
+    }
+}
+
+#[cfg(all(test, not(target_arch = "x86_64")))]
+fn max_isa() -> u8 {
+    0
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn pick_isa() -> u8 {
+    0
+}
+
+/// The three byte classes of 64 bytes at `p` as bit masks (bit k = byte k):
+/// separators (`,` and `\n`), newlines, and quotes.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn class_masks(p: *const u8) -> (u64, u64, u64) {
+    match ISA.load(Relaxed) {
+        #[cfg(feature = "avx512")]
+        2 => masks_avx512(p),
+        1 => masks_avx2(p),
+        _ => masks_sse2(p),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn masks_sse2(p: *const u8) -> (u64, u64, u64) {
+    use std::arch::x86_64::*;
+    let c = _mm_set1_epi8(b',' as i8);
+    let q = _mm_set1_epi8(b'"' as i8);
+    let n = _mm_set1_epi8(b'\n' as i8);
+    let (mut ms, mut mn, mut mq) = (0u64, 0u64, 0u64);
+    for k in 0..4 {
+        let v = _mm_loadu_si128(p.add(16 * k) as *const __m128i);
+        let en = _mm_cmpeq_epi8(v, n);
+        let es = _mm_or_si128(_mm_cmpeq_epi8(v, c), en);
+        let eq = _mm_cmpeq_epi8(v, q);
+        ms |= (_mm_movemask_epi8(es) as u32 as u64) << (16 * k);
+        mn |= (_mm_movemask_epi8(en) as u32 as u64) << (16 * k);
+        mq |= (_mm_movemask_epi8(eq) as u32 as u64) << (16 * k);
+    }
+    (ms, mn, mq)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn masks_avx2(p: *const u8) -> (u64, u64, u64) {
+    use std::arch::x86_64::*;
+    let c = _mm256_set1_epi8(b',' as i8);
+    let q = _mm256_set1_epi8(b'"' as i8);
+    let n = _mm256_set1_epi8(b'\n' as i8);
+    let (mut ms, mut mn, mut mq) = (0u64, 0u64, 0u64);
+    for k in 0..2 {
+        let v = _mm256_loadu_si256(p.add(32 * k) as *const __m256i);
+        let en = _mm256_cmpeq_epi8(v, n);
+        let es = _mm256_or_si256(_mm256_cmpeq_epi8(v, c), en);
+        let eq = _mm256_cmpeq_epi8(v, q);
+        ms |= (_mm256_movemask_epi8(es) as u32 as u64) << (32 * k);
+        mn |= (_mm256_movemask_epi8(en) as u32 as u64) << (32 * k);
+        mq |= (_mm256_movemask_epi8(eq) as u32 as u64) << (32 * k);
+    }
+    (ms, mn, mq)
+}
+
+/// Needs Rust 1.89+ (the AVX-512 intrinsics), hence behind a feature.
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+#[target_feature(enable = "avx512bw")]
+unsafe fn masks_avx512(p: *const u8) -> (u64, u64, u64) {
+    use std::arch::x86_64::*;
+    let v = _mm512_loadu_si512(p as *const _);
+    let mn = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8));
+    let mc = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8));
+    let mq = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'"' as i8));
+    (mc | mn, mn, mq)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn class_masks(p: *const u8) -> (u64, u64, u64) {
+    let (mut ms, mut mn, mut mq) = (0u64, 0u64, 0u64);
+    for k in 0..64 {
+        let b = *p.add(k);
+        ms |= ((b == b',' || b == b'\n') as u64) << k;
+        mn |= ((b == b'\n') as u64) << k;
+        mq |= ((b == b'"') as u64) << k;
+    }
+    (ms, mn, mq)
+}
+
 /// One SIMD pass over a chunk: calls `row` with the N unquoted fields of every
 /// well-formed line (rules.md "CSV dialect"); malformed lines are skipped.
+///
+/// Only separators are visited. A field whose first and last bytes are quotes
+/// (and is at least 2 long) is a quoted field; a line is well-formed when its
+/// quote count (from the quote mask, once per line) is exactly twice its
+/// number of quoted fields, i.e. no quote is anywhere else.
 #[inline(always)]
 fn scan_rows<const N: usize>(data: S, mut row: impl FnMut(&[S; N])) {
+    let len = data.len();
+    let mut fields: [S; N] = [&[]; N];
+    let mut nf = 0usize;
+    let mut quoted = 0u64; // quoted fields in this line
+    let mut fs = 0usize; // current field start
+    let mut qline = 0u64; // quotes before the current line
+    let mut qbase = 0u64; // quotes before the current block
+    let mut line_start = 0usize;
+    let mut tail = [0u8; 64];
+    let mut base = 0usize;
+    let ptr = data.as_ptr();
+    macro_rules! close_field {
+        ($pos:expr) => {{
+            let pos: usize = $pos;
+            let w = pos - fs;
+            // In bounds: fs < len when w > 0, and pos - 1 >= fs then.
+            let b0 = unsafe { *ptr.add(fs.min(len - 1)) };
+            let b1 = unsafe { *ptr.add(pos.max(1) - 1) };
+            let q = (w >= 2) as usize & (b0 == b'"') as usize & (b1 == b'"') as usize;
+            quoted += q as u64;
+            if nf < N {
+                fields[nf] = unsafe { data.get_unchecked(fs + q..pos - q) };
+            }
+            nf += 1;
+        }};
+    }
+    while base < len {
+        let (sep, nl, qm) = if base + 64 <= len {
+            unsafe { class_masks(ptr.add(base)) }
+        } else {
+            tail[..len - base].copy_from_slice(&data[base..]);
+            unsafe { class_masks(tail.as_ptr()) }
+        };
+        let mut m = sep;
+        while m != 0 {
+            let off = m.trailing_zeros();
+            m &= m - 1;
+            let pos = base + off as usize;
+            close_field!(pos);
+            fs = pos + 1;
+            if (nl >> off) & 1 != 0 {
+                let qc = qbase + (qm & ((1u64 << off) - 1)).count_ones() as u64;
+                if nf == N && qc - qline == 2 * quoted {
+                    row(&fields);
+                }
+                qline = qc;
+                nf = 0;
+                quoted = 0;
+                line_start = pos + 1;
+            }
+        }
+        qbase += qm.count_ones() as u64;
+        base += 64;
+    }
+    if line_start < len {
+        close_field!(len);
+        if nf == N && qbase - qline == 2 * quoted {
+            row(&fields);
+        }
+    }
+}
+
+/// One SIMD pass over a chunk: calls `row` with the N unquoted fields of every
+/// well-formed line (rules.md "CSV dialect"); malformed lines are skipped.
+#[allow(dead_code)]
+#[inline(always)]
+fn scan_rows_ref<const N: usize>(data: S, mut row: impl FnMut(&[S; N])) {
     let mut fields: [S; N] = [&[]; N];
     let mut nf = 0usize;
     let mut bad = false;
@@ -1341,6 +1531,7 @@ fn manifest_ts(text: &str, key: &str) -> i64 {
 
 fn main() {
     let t0 = Instant::now();
+    ISA.store(pick_isa(), Relaxed);
     EXP.store(std::env::var("SS_EXP").ok().and_then(|v| v.parse().ok()).unwrap_or(0), Relaxed);
     if let Ok(mb) = std::env::var("FAULTBENCH") {
         let mb: usize = mb.parse().unwrap();
@@ -1382,6 +1573,10 @@ fn main() {
             let mut n = 0usize;
             for c in &chunks { scan_rows::<7>(c.data, |f| n += f[0].len()); }
             let a = t.elapsed();
+            let t = Instant::now();
+            let mut n2 = 0usize;
+            for c in &chunks { scan_rows_ref::<7>(c.data, |f| n2 += f[0].len()); }
+            eprintln!("  scan new {:?} | ref {:?} | same={}", a, t.elapsed(), n == n2);
             let t = Instant::now();
             let mut h = 0u64;
             for c in &chunks { scan_rows::<7>(c.data, |f| { h ^= key(f[0]).0 ^ key(f[1]).0; }); }
@@ -1606,6 +1801,34 @@ mod tests {
         let mut v = Vec::new();
         scan_rows::<N>(s, |f| v.push(f.to_vec()));
         v
+    }
+
+    #[test]
+    fn scanner_matches_reference() {
+        let alphabet = b",,,\"\"\nab \r";
+        let mut seed = 99u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for it in 0..30000 {
+            ISA.store(max_isa().min((it % 3) as u8), Relaxed);
+            let n = (rnd() % 300) as usize;
+            let v: Vec<u8> = (0..n).map(|_| alphabet[(rnd() % alphabet.len() as u64) as usize]).collect();
+            let d: &'static [u8] = Box::leak(v.into_boxed_slice());
+            for k in [1usize, 2, 3, 7] {
+                let (mut a, mut b) = (Vec::new(), Vec::new());
+                match k {
+                    1 => { scan_rows::<1>(d, |f| a.push(f.to_vec())); scan_rows_ref::<1>(d, |f| b.push(f.to_vec())); }
+                    2 => { scan_rows::<2>(d, |f| a.push(f.to_vec())); scan_rows_ref::<2>(d, |f| b.push(f.to_vec())); }
+                    3 => { scan_rows::<3>(d, |f| a.push(f.to_vec())); scan_rows_ref::<3>(d, |f| b.push(f.to_vec())); }
+                    _ => { scan_rows::<7>(d, |f| a.push(f.to_vec())); scan_rows_ref::<7>(d, |f| b.push(f.to_vec())); }
+                }
+                assert_eq!(a, b, "input {:?}", String::from_utf8_lossy(d));
+            }
+        }
     }
 
     #[test]
