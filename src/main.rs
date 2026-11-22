@@ -719,7 +719,7 @@ struct UEv {
 struct UCk {
     who: K,
     ts: i64,
-    cid: S,
+    cid: PS,
     camp: u32,
     pid: u32,
 }
@@ -762,7 +762,7 @@ fn parse_events(ci: usize, c: &Chunk, ctx: &Ctx) -> ParsedChunk {
     let mut keys: Vec<Vec<DE>> = (0..ctx.epart).map(|_| Vec::with_capacity(c.data.len() / 72 / ctx.epart + 4)).collect();
     let cbase = (ci as u64) << 32;
     let m = c.map;
-    let mut tc = TsCache::default();
+    let mut tc = TsCache::new();
     let exp = EXP.load(Relaxed);
     if exp == 1 {
         let mut n = 0usize;
@@ -771,67 +771,69 @@ fn parse_events(ci: usize, c: &Chunk, ctx: &Ctx) -> ParsedChunk {
         prof(1, t);
         return ParsedChunk { recs, keys };
     }
-    scan_rows::<7>(c.data, |f| {
-        let eid = f[m[0] as usize];
-        if eid.is_empty() {
-            return;
-        }
-        let ingest = if exp == 7 { Some(ctx.ws) } else { tc.parse(f[m[3] as usize]) };
-        let mut kind = match f[m[4] as usize] {
-            b"view" => 1,
-            b"cart" => 2,
-            b"purchase" => K_PURCHASE,
-            _ => 0,
-        };
-        let user_s = f[m[1] as usize];
-        let product = f[m[5] as usize];
-        let mut ts = 0u32;
-        let mut price = 0;
-        let mut cat = 0;
-        if kind != 0 && (ingest.is_none() || user_s.is_empty() || product.is_empty()) {
-            kind = 0;
-        }
-        if kind != 0 {
-            match if exp == 6 { Some(ctx.ws) } else { tc.parse(f[m[2] as usize]) } {
-                // Late: ingest_ts - ts over 24 h. (ts is in the window, no overflow.)
-                Some(t) if t >= ctx.ws && t < ctx.we && ingest.unwrap() - t <= DAY => ts = (t - ctx.ws) as u32,
-                _ => kind = 0,
-            }
-        }
-        if kind == K_PURCHASE {
-            match parse_price(f[m[6] as usize]) {
-                Some(p) => {
-                    price = p;
-                    cat = *ctx.products.get(product).unwrap_or(&ctx.unknown_cat);
+    // The row body, instantiated twice: with constant column positions for
+    // the documented header order (every generator file), and through the
+    // column map otherwise.
+    macro_rules! rows {
+        ($col:expr) => {
+            scan_rows::<7>(c.data, |f| {
+                let col = $col;
+                let eid = f[col(0)];
+                if eid.is_empty() {
+                    return;
                 }
-                None => kind = 0,
-            }
-        }
-        let user = if kind != 0 {
-            if exp == 4 { K(user_s.len() as u64, user_s[0] as u64) } else { key(user_s) }
-        } else {
-            K::default()
+                let ingest = tc.parse(f[col(3)]);
+                let mut kind = match f[col(4)] {
+                    b"view" => 1,
+                    b"cart" => 2,
+                    b"purchase" => K_PURCHASE,
+                    _ => 0,
+                };
+                let user_s = f[col(1)];
+                let product = f[col(5)];
+                let mut ts = 0u32;
+                let mut price = 0;
+                let mut cat = 0;
+                if kind != 0 && (ingest.is_none() || user_s.is_empty() || product.is_empty()) {
+                    kind = 0;
+                }
+                if kind != 0 {
+                    match tc.parse(f[col(2)]) {
+                        // Late: ingest_ts - ts over 24 h. (ts is in the window, no overflow.)
+                        Some(t) if t >= ctx.ws && t < ctx.we && ingest.unwrap() - t <= DAY => ts = (t - ctx.ws) as u32,
+                        _ => kind = 0,
+                    }
+                }
+                if kind == K_PURCHASE {
+                    match parse_price(f[col(6)]) {
+                        Some(p) => {
+                            price = p;
+                            cat = *ctx.products.get(product).unwrap_or(&ctx.unknown_cat);
+                        }
+                        None => kind = 0,
+                    }
+                }
+                let user = if kind != 0 { key(user_s) } else { K::default() };
+                let ek = key(eid);
+                if exp == 2 {
+                    std::hint::black_box((ek, user, ts, price, cat, kind, ingest));
+                    return;
+                }
+                let ingest = match ingest {
+                    Some(x) => pack_ingest(x, ctx.ingest_base),
+                    None => u32::MAX,
+                };
+                let h = ek.h();
+                keys[(h >> 40) as usize & emask].push(DE { k0: h, loc: cbase | recs.len() as u64 });
+                recs.push(Ev { eid: ek, user, user_s: PS::new(user_s), ingest, ts, price, cat, kind });
+            })
         };
-        let ek = if exp == 5 {
-            let mut b = [0u8; 8];
-            let n = eid.len().min(8);
-            b[..n].copy_from_slice(&eid[..n]);
-            K(u64::from_le_bytes(b), u64::from_le_bytes(b).rotate_left(29))
-        } else {
-            key(eid)
-        };
-        if exp == 2 {
-            std::hint::black_box((ek, user, ts, price, cat, kind, ingest));
-            return;
-        }
-        let ingest = match ingest {
-            Some(x) => pack_ingest(x, ctx.ingest_base),
-            None => u32::MAX,
-        };
-        let h = ek.h();
-        keys[(h >> 40) as usize & emask].push(DE { k0: h, loc: cbase | recs.len() as u64 });
-        recs.push(Ev { eid: ek, user, user_s: PS::new(user_s), ingest, ts, price, cat, kind });
-    });
+    }
+    if m[..7] == [0, 1, 2, 3, 4, 5, 6] {
+        rows!(|i: usize| i);
+    } else {
+        rows!(|i: usize| m[i] as usize);
+    }
     prof(1, t);
     ParsedChunk { recs, keys }
 }
@@ -920,11 +922,14 @@ fn dedup_events(parts: Vec<Vec<DE>>, recs: &[Vec<Ev>], losers: &[Vec<AtomicU64>]
     prof(4, t);
 }
 
-/// Routes one chunk's surviving events (valid, and not a dedup loser) to their
-/// person partition, in file order; link lookups are prefetched in batches.
-fn route_events(recs: &[Ev], lost: &[AtomicU64], links: &Links) -> Vec<Vec<UEv>> {
+/// Routes the surviving events (valid, and not a dedup loser) of a group of
+/// chunks to their person partitions, in file order; link lookups are
+/// prefetched in batches. Grouping chunks keeps the number of output pieces
+/// per person partition small (about 64, not one per chunk).
+fn route_events(recs: &[Vec<Ev>], lost: &[Vec<AtomicU64>], links: &Links) -> Vec<Vec<UEv>> {
     let t = Instant::now();
-    let mut out: Vec<Vec<UEv>> = new_parts(recs.len() / NPART + 8);
+    let total: usize = recs.iter().map(|r| r.len()).sum();
+    let mut out: Vec<Vec<UEv>> = new_parts(total / NPART + total / (NPART * 8) + 16);
     const B: usize = 32;
     let dummy = Ev { eid: K(0, 0), user: K(0, 0), user_s: PS::new(&[]), ingest: 0, ts: 0, price: 0, cat: 0, kind: 0 };
     let mut batch: [&Ev; B] = [&dummy; B];
@@ -939,17 +944,19 @@ fn route_events(recs: &[Ev], lost: &[AtomicU64], links: &Links) -> Vec<Vec<UEv>>
             out[part].push(UEv { who: e.user, pid, who_s: e.user_s, ts: e.ts, price: e.price, cat: e.cat, kind: e.kind });
         }
     };
-    for (w, block) in recs.chunks(64).enumerate() {
-        let lw = lost[w].load(Relaxed);
-        for (j, e) in block.iter().enumerate() {
-            if e.kind == 0 || (lw >> j) & 1 == 1 {
-                continue;
-            }
-            batch[nb] = e;
-            nb += 1;
-            if nb == B {
-                emit(&batch, &mut out);
-                nb = 0;
+    for (recs, lost) in recs.iter().zip(lost) {
+        for (w, block) in recs.chunks(64).enumerate() {
+            let lw = lost[w].load(Relaxed);
+            for (j, e) in block.iter().enumerate() {
+                if e.kind == 0 || (lw >> j) & 1 == 1 {
+                    continue;
+                }
+                batch[nb] = e;
+                nb += 1;
+                if nb == B {
+                    emit(&batch, &mut out);
+                    nb = 0;
+                }
             }
         }
     }
@@ -966,7 +973,7 @@ fn parse_clicks(c: &Chunk, ctx: &Ctx, links: &Links) -> Vec<Vec<UCk>> {
     let mut out: Vec<Vec<UCk>> = new_parts(c.data.len() / 50 / NPART + 4);
     let m = c.map;
     let lo = ctx.ws - WEEK;
-    let mut tc = TsCache::default();
+    let mut tc = TsCache::new();
     // Valid clicks wait in a small batch so their link lookups can be prefetched.
     const B: usize = 32;
     let mut buf: Vec<UCk> = Vec::with_capacity(B);
@@ -977,27 +984,38 @@ fn parse_clicks(c: &Chunk, ctx: &Ctx, links: &Links) -> Vec<Vec<UCk>> {
             out[part].push(c);
         }
     };
-    scan_rows::<4>(c.data, |f| {
-        let cid = f[m[0] as usize];
-        let user = f[m[1] as usize];
-        if cid.is_empty() || user.is_empty() {
-            return;
-        }
-        let ts = match tc.parse(f[m[3] as usize]) {
-            Some(t) if t >= lo && t < ctx.we => t,
-            _ => return,
+    // Constant column positions for the documented header order.
+    macro_rules! rows {
+        ($col:expr) => {
+            scan_rows::<4>(c.data, |f| {
+                let col = $col;
+                let cid = f[col(0)];
+                let user = f[col(1)];
+                if cid.is_empty() || user.is_empty() {
+                    return;
+                }
+                let ts = match tc.parse(f[col(3)]) {
+                    Some(t) if t >= lo && t < ctx.we => t,
+                    _ => return,
+                };
+                let camp = match ctx.campaigns.get(f[col(2)]) {
+                    Some(&c) => c,
+                    None => return,
+                };
+                let k = key(user);
+                links.prefetch(k);
+                buf.push(UCk { who: k, ts, cid: PS::new(cid), camp, pid: NO_PID });
+                if buf.len() == B {
+                    flush(&mut buf, &mut out);
+                }
+            })
         };
-        let camp = match ctx.campaigns.get(f[m[2] as usize]) {
-            Some(&c) => c,
-            None => return,
-        };
-        let k = key(user);
-        links.prefetch(k);
-        buf.push(UCk { who: k, ts, cid, camp, pid: NO_PID });
-        if buf.len() == B {
-            flush(&mut buf, &mut out);
-        }
-    });
+    }
+    if m[..4] == [0, 1, 2, 3] {
+        rows!(|i: usize| i);
+    } else {
+        rows!(|i: usize| m[i] as usize);
+    }
     flush(&mut buf, &mut out);
     prof(3, t);
     out
@@ -1017,7 +1035,7 @@ struct E2 {
 #[derive(Clone, Copy)]
 struct C2 {
     ts: i64,
-    cid: S,
+    cid: PS,
     camp: u32,
 }
 
@@ -1276,7 +1294,7 @@ fn process_partition(part: usize, evs: Vec<Vec<UEv>>, cks: Vec<Vec<UCk>>, ctx: &
         coff[p + 1] = coff[p] + ccnt[p];
     }
     let mut cpos = coff.clone();
-    let mut carr: Vec<C2> = vec![C2 { ts: 0, cid: &[], camp: 0 }; coff[np] as usize];
+    let mut carr: Vec<C2> = vec![C2 { ts: 0, cid: PS::new(&[]), camp: 0 }; coff[np] as usize];
     let mut k = 0;
     for v in cks {
         for c in v {
@@ -1294,7 +1312,7 @@ fn process_partition(part: usize, evs: Vec<Vec<UEv>>, cks: Vec<Vec<UCk>>, ctx: &
     for p in 0..np {
         arr[off[p] as usize..off[p + 1] as usize].sort_unstable_by_key(|e| e.ts);
         carr[coff[p] as usize..coff[p + 1] as usize]
-            .sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.cid.cmp(b.cid)));
+            .sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.cid.get().cmp(b.cid.get())));
     }
     prof(6, t);
     let t = Instant::now();
@@ -1482,7 +1500,9 @@ fn main() {
     let (ev_by_person, ck_by_person) = rayon::join(
         || {
             transpose(keys).into_par_iter().for_each(|p| dedup_events(p, &recs, &losers));
-            recs.par_iter().zip(losers.par_iter()).map(|(r, l)| route_events(r, l, &links)).collect::<Vec<_>>()
+            // About 64 routing tasks: enough to balance the threads.
+            let g = recs.len().div_ceil(64).max(1);
+            recs.par_chunks(g).zip(losers.par_chunks(g)).map(|(r, l)| route_events(r, l, &links)).collect::<Vec<_>>()
         },
         || ck_chunks.par_iter().map(|c| parse_clicks(c, &ctx, &links)).collect::<Vec<_>>(),
     );
@@ -1608,6 +1628,8 @@ mod tests {
 }
 
 // Record sizes are part of the performance design; keep them from growing.
+const _: () = assert!(std::mem::size_of::<UCk>() == 40);
+const _: () = assert!(std::mem::size_of::<C2>() == 24);
 const _: () = assert!(std::mem::size_of::<Ev>() == 56);
 const _: () = assert!(std::mem::size_of::<UEv>() == 40);
 const _: () = assert!(std::mem::size_of::<E2>() == 12);

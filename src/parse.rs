@@ -248,10 +248,22 @@ fn digits_at(v: u64, m: u64) -> bool {
 }
 
 /// Timestamp parser for the hot loops. Results are identical to `parse_ts`.
-#[derive(Default)]
-pub struct TsCache;
+pub struct TsCache {
+    t: &'static DateTable,
+}
+
+impl Default for TsCache {
+    fn default() -> Self {
+        TsCache::new()
+    }
+}
 
 impl TsCache {
+    /// Resolves the date table once, so the hot loop does not.
+    pub fn new() -> TsCache {
+        TsCache { t: dates() }
+    }
+
     /// `YYYY-MM-DDTHH:MM:SS` (first 19 bytes of s, s.len() >= 20) to epoch ms.
     #[inline(always)]
     fn civil_ms(&mut self, s: &[u8]) -> Option<i64> {
@@ -271,7 +283,7 @@ impl TsCache {
         let year = b(0) * 1000 + b(1) * 100 + b(2) * 10 + b(3);
         let month = b(5) * 10 + b(6);
         let day = d8 as i64 * 10 + d9 as i64;
-        let t = dates();
+        let t = self.t;
         let days = if year >= t.base && year < t.base + t.years && (1..=12).contains(&month) && day < 32 {
             let v = t.days[(((year - t.base) * 12 + month - 1) * 32 + day) as usize];
             if v == NO_DATE {
