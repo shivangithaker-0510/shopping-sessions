@@ -1015,7 +1015,7 @@ fn parse_events(_ci: usize, c: &Chunk, ctx: &Ctx) -> ParsedChunk {
                     None => u32::MAX,
                 };
                 let h = ek.h();
-                keys[(h >> 40) as usize & emask].push(DE { k: ek, ingest, row: recs.len() as u32 });
+                keys[(h >> 40) as usize & emask].push(DE { h, ingest, row: recs.len() as u32 });
                 recs.push(Ev { user, user_s: PS::new(user_s), ts, price, cat, kind });
             })
         };
@@ -1029,18 +1029,21 @@ fn parse_events(_ci: usize, c: &Chunk, ctx: &Ctx) -> ParsedChunk {
     ParsedChunk { recs, keys }
 }
 
-/// One dedup entry: a copy's whole event-id key, its packed ingest_ts, and
-/// its row: within its chunk when parsed, then (inside dedup) its global row
-/// (chunk offset + row). Dedup needs nothing else, so it never touches the
-/// event records. `row == u32::MAX` marks an empty table slot.
+/// One dedup entry: a copy's event id as a 64-bit hash (`K::h`), its packed
+/// ingest_ts, and its row: within its chunk when parsed, then (inside dedup)
+/// its global row (chunk offset + row). Event ids are compared by the hash
+/// alone: two distinct ids share one with odds of about n^2 / 2^65 (1e-5 at
+/// 20M rows), traded for a 16-byte entry. `row == u32::MAX` marks an empty
+/// table slot.
 #[derive(Clone, Copy)]
+#[repr(C, align(16))]
 struct DE {
-    k: K,
+    h: u64,
     ingest: u32,
     row: u32,
 }
 
-const DE_EMPTY: DE = DE { k: K(0, 0), ingest: 0, row: u32::MAX };
+const DE_EMPTY: DE = DE { h: 0, ingest: 0, row: u32::MAX };
 
 thread_local! {
     static DEDUP_TABLE: std::cell::RefCell<(Vec<Vec<DE>>, Vec<DE>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
@@ -1073,7 +1076,7 @@ fn dedup_events(parts: Vec<Vec<DE>>, off: &[u32], losers: &[AtomicU64]) {
         for (ci, v) in parts.iter().enumerate() {
             let base = off[ci];
             for &x in v {
-                let h = x.k.h();
+                let h = x.h;
                 buckets[if sub_bits == 0 { 0 } else { (h >> (64 - sub_bits)) as usize }].push(DE { row: base + x.row, ..x });
             }
         }
@@ -1083,14 +1086,14 @@ fn dedup_events(parts: Vec<Vec<DE>>, off: &[u32], losers: &[AtomicU64]) {
             table.clear();
             table.resize(cap, DE_EMPTY);
             for &x in b {
-                let mut i = x.k.h() as usize & mask;
+                let mut i = x.h as usize & mask;
                 loop {
                     let d = table[i];
                     if d.row == u32::MAX {
                         table[i] = x;
                         break;
                     }
-                    if d.k == x.k {
+                    if d.h == x.h {
                         // Smallest ingest_ts wins; equal ones are identical copies.
                         if x.ingest < d.ingest {
                             lose(d.row);
@@ -1881,6 +1884,6 @@ mod tests {
 const _: () = assert!(std::mem::size_of::<UCk>() == 40);
 const _: () = assert!(std::mem::size_of::<C2>() == 24);
 const _: () = assert!(std::mem::size_of::<Ev>() == 40);
-const _: () = assert!(std::mem::size_of::<DE>() == 24);
+const _: () = assert!(std::mem::size_of::<DE>() == 16);
 const _: () = assert!(std::mem::size_of::<UEv>() == 40);
 const _: () = assert!(std::mem::size_of::<E2>() == 12);
