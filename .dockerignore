@@ -1,0 +1,10 @@
+target/
+data/
+out/
+_dl/
+tools/
+fixtures/
+scripts/
+.git
+*.zip
+*.md

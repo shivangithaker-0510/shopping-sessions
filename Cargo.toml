@@ -1,0 +1,25 @@
+[package]
+name = "sessions"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "sessions"
+path = "src/main.rs"
+
+[dependencies]
+rayon = "1.10"
+memchr = "2.7"
+memmap2 = "0.9"
+hashbrown = "0.15"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+parquet = { version = "53", default-features = false }
+bytes = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false

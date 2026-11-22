@@ -10,3 +10,8 @@ dev-answer/
 target/
 __pycache__/
 .venv/
+_dl/
+tools/
+bench/*.log
+!fixtures/**
+!fixtures/**/*.csv
