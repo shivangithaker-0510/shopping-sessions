@@ -922,11 +922,14 @@ fn dedup_events(parts: Vec<Vec<DE>>, recs: &[Vec<Ev>], losers: &[Vec<AtomicU64>]
     prof(4, t);
 }
 
-/// Routes one chunk's surviving events (valid, and not a dedup loser) to their
-/// person partition, in file order; link lookups are prefetched in batches.
-fn route_events(recs: &[Ev], lost: &[AtomicU64], links: &Links) -> Vec<Vec<UEv>> {
+/// Routes the surviving events (valid, and not a dedup loser) of a group of
+/// chunks to their person partitions, in file order; link lookups are
+/// prefetched in batches. Grouping chunks keeps the number of output pieces
+/// per person partition small (about 64, not one per chunk).
+fn route_events(recs: &[Vec<Ev>], lost: &[Vec<AtomicU64>], links: &Links) -> Vec<Vec<UEv>> {
     let t = Instant::now();
-    let mut out: Vec<Vec<UEv>> = new_parts(recs.len() / NPART + 8);
+    let total: usize = recs.iter().map(|r| r.len()).sum();
+    let mut out: Vec<Vec<UEv>> = new_parts(total / NPART + total / (NPART * 8) + 16);
     const B: usize = 32;
     let dummy = Ev { eid: K(0, 0), user: K(0, 0), user_s: PS::new(&[]), ingest: 0, ts: 0, price: 0, cat: 0, kind: 0 };
     let mut batch: [&Ev; B] = [&dummy; B];
@@ -941,17 +944,19 @@ fn route_events(recs: &[Ev], lost: &[AtomicU64], links: &Links) -> Vec<Vec<UEv>>
             out[part].push(UEv { who: e.user, pid, who_s: e.user_s, ts: e.ts, price: e.price, cat: e.cat, kind: e.kind });
         }
     };
-    for (w, block) in recs.chunks(64).enumerate() {
-        let lw = lost[w].load(Relaxed);
-        for (j, e) in block.iter().enumerate() {
-            if e.kind == 0 || (lw >> j) & 1 == 1 {
-                continue;
-            }
-            batch[nb] = e;
-            nb += 1;
-            if nb == B {
-                emit(&batch, &mut out);
-                nb = 0;
+    for (recs, lost) in recs.iter().zip(lost) {
+        for (w, block) in recs.chunks(64).enumerate() {
+            let lw = lost[w].load(Relaxed);
+            for (j, e) in block.iter().enumerate() {
+                if e.kind == 0 || (lw >> j) & 1 == 1 {
+                    continue;
+                }
+                batch[nb] = e;
+                nb += 1;
+                if nb == B {
+                    emit(&batch, &mut out);
+                    nb = 0;
+                }
             }
         }
     }
@@ -1495,7 +1500,9 @@ fn main() {
     let (ev_by_person, ck_by_person) = rayon::join(
         || {
             transpose(keys).into_par_iter().for_each(|p| dedup_events(p, &recs, &losers));
-            recs.par_iter().zip(losers.par_iter()).map(|(r, l)| route_events(r, l, &links)).collect::<Vec<_>>()
+            // About 64 routing tasks: enough to balance the threads.
+            let g = recs.len().div_ceil(64).max(1);
+            recs.par_chunks(g).zip(losers.par_chunks(g)).map(|(r, l)| route_events(r, l, &links)).collect::<Vec<_>>()
         },
         || ck_chunks.par_iter().map(|c| parse_clicks(c, &ctx, &links)).collect::<Vec<_>>(),
     );
