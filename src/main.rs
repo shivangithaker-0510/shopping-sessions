@@ -1585,11 +1585,31 @@ fn main() {
             let mut z = 0i64;
             for c in &chunks { scan_rows::<7>(c.data, |f| { z += parse_ts(f[2]).unwrap_or(0) + parse_ts(f[3]).unwrap_or(0); }); }
             let c2 = t.elapsed();
-            let ctx = Ctx { epart: EPART_DEFAULT, ws: 0, ingest_base: 0, we: i64::MAX, products: HashMap::new(), campaigns: HashMap::new(), unknown_cat: 0, ncamp: 0, day0: 0, ndays: 1 };
+            let man = std::fs::read_to_string(Path::new(&dir).join("manifest.json")).unwrap();
+            let (ws, we) = (manifest_ts(&man, "window_start"), manifest_ts(&man, "window_end"));
+            parse::init_dates(ws);
+            let ctx = Ctx { epart: EPART_DEFAULT, ws, ingest_base: ws / 1000 - 86_400 * 30, we, products: HashMap::new(), campaigns: HashMap::new(), unknown_cat: 0, ncamp: 0, day0: 0, ndays: 1 };
+            let t = Instant::now();
+            let mut tc = TsCache::new();
+            let mut z2 = 0i64;
+            for c in &chunks { scan_rows::<7>(c.data, |f| { z2 += tc.parse(f[2]).unwrap_or(0) + tc.parse(f[3]).unwrap_or(0); }); }
+            let e_ts = t.elapsed();
+            let t = Instant::now();
+            let mut z3 = 0i64;
+            for c in &chunks { scan_rows::<7>(c.data, |f| { z3 += tc.parse(f[3]).unwrap_or(0); }); }
+            let e_ing = t.elapsed();
+            EXP.store(2, Relaxed);
+            let t = Instant::now();
+            for (ci, c) in chunks.iter().enumerate() { std::hint::black_box(parse_events(ci, c, &ctx).recs.len()); }
+            let e_nostore = t.elapsed();
+            EXP.store(0, Relaxed);
             let t = Instant::now();
             let mut m = 0usize;
-            for (ci, c) in chunks.iter().enumerate() { m += parse_events(ci, c, &ctx).recs.len(); }
+            let mut valid = 0usize;
+            for (ci, c) in chunks.iter().enumerate() { let p = parse_events(ci, c, &ctx); m += p.recs.len(); valid += p.recs.iter().filter(|e| e.kind != 0).count(); }
             let d = t.elapsed();
+            eprintln!("  rows {m} valid {valid}");
+            eprintln!("  scan+TsCache(ts,ingest) {:?} | scan+TsCache(ingest) {:?} | parse no-store {:?} | parse full {:?} {}", e_ts, e_ing, e_nostore, d, (z2 ^ z3) & 1);
             eprintln!("round {round}: {} MB, {} rows | scan {:?} ({:.0} MB/s) | scan+2 hashes {:?} | scan+2 ts {:?} | parse_events {:?} ({:.0} ns/row) {} {}",
                 bytes >> 20, m, a, bytes as f64 / a.as_secs_f64() / 1e6, b, c2, d, d.as_nanos() as f64 / m as f64, n, h as u8 as i64 + z % 2);
         }
