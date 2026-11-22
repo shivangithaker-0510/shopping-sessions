@@ -127,7 +127,13 @@ fn mem_stats() -> String {
     let f: Vec<&str> = stat.rsplit(')').next().unwrap_or("").split_whitespace().collect();
     if f.len() > 10 {
         let tick = |i: usize| f[i].parse::<f64>().unwrap_or(0.0) / 100.0;
-        format!("| {hwm} minflt={} usr={:.2} sys={:.2}", f[7], tick(11), tick(12))
+        let thp = std::fs::read_to_string("/proc/self/smaps_rollup")
+            .unwrap_or_default()
+            .lines()
+            .find(|l| l.starts_with("AnonHugePages"))
+            .map(|l| l.split_whitespace().nth(1).unwrap_or("0").to_string())
+            .unwrap_or_default();
+        format!("| {hwm} minflt={} usr={:.2} sys={:.2} thpkB={thp}", f[7], tick(11), tick(12))
     } else {
         String::new()
     }
