@@ -149,6 +149,97 @@ fn civil_ms(s: &[u8]) -> Option<i64> {
     Some(((days * 24 + hour) * 60 + minute) * 60_000 + second * 1_000)
 }
 
+/// Remembers the last validated `YYYY-MM-DD` so repeated dates skip the
+/// calendar math. Results are identical to `parse_ts`.
+#[derive(Default)]
+pub struct TsCache {
+    date: [u8; 10],
+    days: i64,
+}
+
+impl TsCache {
+    #[inline]
+    fn civil_ms(&mut self, s: &[u8]) -> Option<i64> {
+        if s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+            return None;
+        }
+        let days = if s[..10] == self.date {
+            self.days
+        } else {
+            if s[4] != b'-' || s[7] != b'-' {
+                return None;
+            }
+            let year = d2(s, 0)? * 100 + d2(s, 2)?;
+            let month = d2(s, 5)?;
+            let day = d2(s, 8)?;
+            if !(1..=12).contains(&month) || day < 1 {
+                return None;
+            }
+            let dim = match month {
+                1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+                4 | 6 | 9 | 11 => 30,
+                _ => {
+                    if is_leap(year) {
+                        29
+                    } else {
+                        28
+                    }
+                }
+            };
+            if day > dim {
+                return None;
+            }
+            let d = days_from_civil(year, month, day);
+            self.date.copy_from_slice(&s[..10]);
+            self.days = d;
+            d
+        };
+        let hour = d2(s, 11)?;
+        let minute = d2(s, 14)?;
+        let second = d2(s, 17)?;
+        if hour > 23 || minute > 59 || second > 59 {
+            return None;
+        }
+        Some(((days * 24 + hour) * 60 + minute) * 60_000 + second * 1_000)
+    }
+
+    /// Same contract as `parse_ts`.
+    #[inline]
+    pub fn parse(&mut self, s: &[u8]) -> Option<i64> {
+        let n = s.len();
+        if n == 0 {
+            return None;
+        }
+        if s[0].is_ascii_digit() && (n < 5 || s[4] != b'-') {
+            return parse_ts(s);
+        }
+        if n == 20 {
+            if s[19] != b'Z' {
+                return None;
+            }
+            return self.civil_ms(s);
+        }
+        if n == 25 {
+            let sign = match s[19] {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            if s[22] != b':' {
+                return None;
+            }
+            let oh = d2(s, 20)?;
+            let om = d2(s, 23)?;
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            let local = self.civil_ms(s)?;
+            return Some(local - sign * (oh * 60 + om) * 60_000);
+        }
+        None
+    }
+}
+
 /// Parse F1, F2 or F3 into epoch ms. None means a bad timestamp (including an
 /// F3 value too large for i64, which can never be inside a window).
 #[inline]
@@ -244,6 +335,25 @@ mod tests {
         assert!(parse_ts(b"2028-02-29T00:00:00Z").is_some());
         assert_eq!(parse_ts(b"86400000"), Some(86_400_000));
         assert_eq!(parse_ts(b"000000000000000000000000001"), Some(1));
+    }
+
+    #[test]
+    fn cache_agrees() {
+        let mut c = TsCache::default();
+        let cases: [&[u8]; 12] = [
+            b"2026-10-03T23:58:10Z", b"2026-10-03T19:58:10-04:00", b"2026-10-03T24:58:10Z",
+            b"2026-02-29T00:00:00Z", b"2028-02-29T00:00:00Z", b"2028-02-29T00:00:60Z",
+            b"2026-10-03T23:58:10+05:60", b"2026-10-03X23:58:10Z", b"0000000000000", b"2026-10-03T23:58:10z",
+            b"2026/10/03T23:58:10Z", b"2026-10-03T23:58:10Z",
+        ];
+        for _ in 0..2 {
+            for s in cases {
+                assert_eq!(c.parse(s), parse_ts(s), "{}", String::from_utf8_lossy(s));
+            }
+        }
+        // A cached date must not bypass separator checks on a different string.
+        c.parse(b"2026-10-03T23:58:10Z");
+        assert_eq!(c.parse(b"2026-10-03T23-58:10Z"), None);
     }
 
     #[test]

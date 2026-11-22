@@ -108,13 +108,18 @@ fn map_file(p: &Path) -> S {
     if len == 0 {
         return &[];
     }
-    // MAP_POPULATE: build the page tables in one call instead of one fault per page.
-    let populate = std::env::var("SS_POPULATE").map_or(true, |v| v != "0");
+    // Asynchronous readahead of the whole file, so disk reads overlap parsing
+    // (SS_POPULATE=1 instead pre-faults the mapping synchronously).
+    let populate = std::env::var("SS_POPULATE").is_ok_and(|v| v == "1");
     let mut opts = memmap2::MmapOptions::new();
     if populate {
         opts.populate();
     }
     let m = unsafe { opts.map(&f) }.unwrap_or_else(|e| panic!("mmap {}: {e}", p.display()));
+    #[cfg(unix)]
+    if !populate {
+        let _ = m.advise(memmap2::Advice::WillNeed);
+    }
     let m: &'static memmap2::Mmap = Box::leak(Box::new(m));
     &m[..]
 }
@@ -576,12 +581,13 @@ fn parse_events(c: &Chunk, ctx: &Ctx) -> Vec<Vec<Ev>> {
     let t = Instant::now();
     let mut out: Vec<Vec<Ev>> = new_parts(c.data.len() / 72 / NPART + 4);
     let m = c.map;
+    let mut tc = TsCache::default();
     scan_rows::<7>(c.data, |f| {
         let eid = f[m[0] as usize];
         if eid.is_empty() {
             return;
         }
-        let ingest = parse_ts(f[m[3] as usize]);
+        let ingest = tc.parse(f[m[3] as usize]);
         let mut kind = match f[m[4] as usize] {
             b"view" => 1,
             b"cart" => 2,
@@ -597,7 +603,7 @@ fn parse_events(c: &Chunk, ctx: &Ctx) -> Vec<Vec<Ev>> {
             kind = 0;
         }
         if kind != 0 {
-            match parse_ts(f[m[2] as usize]) {
+            match tc.parse(f[m[2] as usize]) {
                 // Late: ingest_ts - ts over 24 h. (ts is in the window, no overflow.)
                 Some(t) if t >= ctx.ws && t < ctx.we && ingest.unwrap() - t <= DAY => ts = t,
                 _ => kind = 0,
@@ -690,13 +696,32 @@ fn parse_clicks(c: &Chunk, ctx: &Ctx, links: &Links) -> Vec<Vec<UCk>> {
     let mut out: Vec<Vec<UCk>> = new_parts(c.data.len() / 50 / NPART + 4);
     let m = c.map;
     let lo = ctx.ws - WEEK;
+    let mut tc = TsCache::default();
+    // Valid clicks wait in a small batch so their link lookups can be prefetched.
+    const B: usize = 32;
+    let mut buf: Vec<UCk> = Vec::with_capacity(B);
+    let mut g = [0u32; B];
+    let flush = |buf: &mut Vec<UCk>, g: &mut [u32; B], out: &mut Vec<Vec<UCk>>| {
+        for (j, c) in buf.iter().enumerate() {
+            g[j] = links.find(c.who);
+            if g[j] != u32::MAX {
+                links.prefetch_name(g[j]);
+            }
+        }
+        for (j, mut c) in buf.drain(..).enumerate() {
+            if g[j] != u32::MAX {
+                c.who = links.names[g[j] as usize].0;
+            }
+            out[c.who.part()].push(c);
+        }
+    };
     scan_rows::<4>(c.data, |f| {
         let cid = f[m[0] as usize];
         let user = f[m[1] as usize];
         if cid.is_empty() || user.is_empty() {
             return;
         }
-        let ts = match parse_ts(f[m[3] as usize]) {
+        let ts = match tc.parse(f[m[3] as usize]) {
             Some(t) if t >= lo && t < ctx.we => t,
             _ => return,
         };
@@ -705,9 +730,13 @@ fn parse_clicks(c: &Chunk, ctx: &Ctx, links: &Links) -> Vec<Vec<UCk>> {
             None => return,
         };
         let k = key(user);
-        let who = links.person(k).map_or(k, |x| x.0);
-        out[who.part()].push(UCk { who, ts, cid, camp });
+        links.prefetch(k);
+        buf.push(UCk { who: k, ts, cid, camp });
+        if buf.len() == B {
+            flush(&mut buf, &mut g, &mut out);
+        }
     });
+    flush(&mut buf, &mut g, &mut out);
     prof(3, t);
     out
 }
