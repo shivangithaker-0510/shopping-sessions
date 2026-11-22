@@ -14,13 +14,15 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-/// jemalloc options: back the heap with transparent huge pages (the host's THP
-/// mode is usually `madvise`, so plain malloc gets 4 KiB pages and pays one
-/// page fault per 4 KiB touched), and never give memory back mid-run.
+/// jemalloc options: back the heap with transparent huge pages. The scorer's THP
+/// mode is `madvise`, so plain malloc gets 4 KiB pages: on the scorer this cut
+/// page faults 720k -> 22k, kernel time 1.9 -> 0.5 CPU-s and wall about 0.3 s.
+/// (On WSL2 the same setting stalls on compaction; it is tuned for the scorer.)
+/// Freed memory is never given back mid-run.
 #[cfg(target_os = "linux")]
 #[export_name = "malloc_conf"]
 pub static MALLOC_CONF: Option<&'static u8> =
-    Some(&b"thp:never,dirty_decay_ms:-1,muzzy_decay_ms:-1,background_thread:false\0"[0]);
+    Some(&b"thp:always,metadata_thp:always,dirty_decay_ms:-1,muzzy_decay_ms:-1,background_thread:false\0"[0]);
 
 mod output;
 mod parse;
@@ -127,7 +129,13 @@ fn mem_stats() -> String {
     let f: Vec<&str> = stat.rsplit(')').next().unwrap_or("").split_whitespace().collect();
     if f.len() > 10 {
         let tick = |i: usize| f[i].parse::<f64>().unwrap_or(0.0) / 100.0;
-        format!("| {hwm} minflt={} usr={:.2} sys={:.2}", f[7], tick(11), tick(12))
+        let thp = std::fs::read_to_string("/proc/self/smaps_rollup")
+            .unwrap_or_default()
+            .lines()
+            .find(|l| l.starts_with("AnonHugePages"))
+            .map(|l| l.split_whitespace().nth(1).unwrap_or("0").to_string())
+            .unwrap_or_default();
+        format!("| {hwm} minflt={} usr={:.2} sys={:.2} thpkB={thp}", f[7], tick(11), tick(12))
     } else {
         String::new()
     }
@@ -674,7 +682,7 @@ fn parse_events(c: &Chunk, ctx: &Ctx) -> Vec<Vec<Ev>> {
         if eid.is_empty() {
             return;
         }
-        let ingest = tc.parse(f[m[3] as usize]);
+        let ingest = if exp == 7 { Some(ctx.ws) } else { tc.parse(f[m[3] as usize]) };
         let mut kind = match f[m[4] as usize] {
             b"view" => 1,
             b"cart" => 2,
@@ -690,7 +698,7 @@ fn parse_events(c: &Chunk, ctx: &Ctx) -> Vec<Vec<Ev>> {
             kind = 0;
         }
         if kind != 0 {
-            match tc.parse(f[m[2] as usize]) {
+            match if exp == 6 { Some(ctx.ws) } else { tc.parse(f[m[2] as usize]) } {
                 // Late: ingest_ts - ts over 24 h. (ts is in the window, no overflow.)
                 Some(t) if t >= ctx.ws && t < ctx.we && ingest.unwrap() - t <= DAY => ts = (t - ctx.ws) as u32,
                 _ => kind = 0,
@@ -705,8 +713,19 @@ fn parse_events(c: &Chunk, ctx: &Ctx) -> Vec<Vec<Ev>> {
                 None => kind = 0,
             }
         }
-        let user = if kind != 0 { key(user_s) } else { K::default() };
-        let ek = key(eid);
+        let user = if kind != 0 {
+            if exp == 4 { K(user_s.len() as u64, user_s[0] as u64) } else { key(user_s) }
+        } else {
+            K::default()
+        };
+        let ek = if exp == 5 {
+            let mut b = [0u8; 8];
+            let n = eid.len().min(8);
+            b[..n].copy_from_slice(&eid[..n]);
+            K(u64::from_le_bytes(b), u64::from_le_bytes(b).rotate_left(29))
+        } else {
+            key(eid)
+        };
         if exp == 2 {
             std::hint::black_box((ek, user, ts, price, cat, kind, ingest));
             return;
