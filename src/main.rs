@@ -84,6 +84,30 @@ fn key(s: &[u8]) -> K {
     K(lo, hi | (n as u64) << 56)
 }
 
+/// A user ID as a 64-bit hash (the mix of its exact key). Distinct user IDs
+/// share one with odds of about n^2 / 2^65 (n ~ 1.5M distinct IDs at 20M
+/// events: ~1e-7), traded for 8-byte keys in every event, click and link
+/// slot.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub struct U(u64);
+
+#[inline(always)]
+fn ukey(s: &[u8]) -> U {
+    U(key(s).mix())
+}
+
+impl U {
+    #[inline(always)]
+    fn h(self) -> u64 {
+        self.0
+    }
+    /// Same bits as `K::part` of the full key.
+    #[inline(always)]
+    fn part(self) -> usize {
+        (self.0 >> 40) as usize & (NPART - 1)
+    }
+}
+
 impl K {
     /// A well-spread 64-bit hash of the key (folded 128-bit multiply).
     #[inline(always)]
@@ -623,15 +647,15 @@ fn new_parts<T>(cap: usize) -> Vec<Vec<T>> {
 const NO_PID: u32 = u32::MAX;
 
 /// One slot of the link table: an ID key and its person's dense id, in one
-/// 32-byte aligned line. An empty slot has `pid == NO_PID`.
+/// 16-byte aligned line. An empty slot has `pid == NO_PID`.
 #[derive(Clone, Copy)]
-#[repr(C, align(32))]
+#[repr(C, align(16))]
 struct Slot {
-    k: K,
+    k: U,
     pid: u32,
 }
 
-const SLOT_EMPTY: Slot = Slot { k: K(0, 0), pid: NO_PID };
+const SLOT_EMPTY: Slot = Slot { k: U(0), pid: NO_PID };
 
 /// Every linked ID -> its person, as a flat open-addressing table split into
 /// one region per partition (so regions build in parallel); one cache miss
@@ -646,11 +670,11 @@ struct Links {
 
 impl Links {
     #[inline(always)]
-    fn slot(&self, k: K) -> usize {
+    fn slot(&self, k: U) -> usize {
         (k.part() << self.rbits) | (k.h() as usize & ((1 << self.rbits) - 1))
     }
     #[inline(always)]
-    fn prefetch(&self, k: K) {
+    fn prefetch(&self, k: U) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             use std::arch::x86_64::*;
@@ -659,7 +683,7 @@ impl Links {
     }
     /// The dense person id of a linked ID, or NO_PID if the ID is in no link.
     #[inline(always)]
-    fn find(&self, k: K) -> u32 {
+    fn find(&self, k: U) -> u32 {
         let base = k.part() << self.rbits;
         let m = (1usize << self.rbits) - 1;
         let mut i = k.h() as usize & m;
@@ -690,11 +714,11 @@ struct LinksFront {
     nids: usize,
     offs: Vec<u32>,
     side: Vec<u32>,
-    all: Vec<(K, S)>,
+    all: Vec<(U, S)>,
     /// First 8 bytes of each ID, big-endian and zero-padded: comparing these
     /// orders IDs byte-wise except on ties, which compare the full strings.
     pre: Vec<u64>,
-    ids: Vec<Vec<K>>,
+    ids: Vec<Vec<U>>,
 }
 
 /// Parses and interns the link files. Run it on the whole pool before event
@@ -705,10 +729,10 @@ fn links_front(files: &[S]) -> LinksFront {
     macro_rules! lp { ($m:expr) => { if std::env::var("SS_LINKPROF").is_ok() { eprintln!("  links {:>7.3}s {}", lt.elapsed().as_secs_f64(), $m); } } }
     let chunks = make_chunks(files, &["user_id_a", "user_id_b"]);
     // Parse; each task emits its pairs' sides scattered by partition.
-    let per_task: Vec<(usize, Vec<Vec<(K, u32, S)>>)> = chunks
+    let per_task: Vec<(usize, Vec<Vec<(U, u32, S)>>)> = chunks
         .par_iter()
         .map(|c| {
-            let mut out: Vec<Vec<(K, u32, S)>> = new_parts(0);
+            let mut out: Vec<Vec<(U, u32, S)>> = new_parts(0);
             let mut n = 0u32;
             scan_rows::<2>(c.data, |f| {
                 let a = f[c.map[0] as usize];
@@ -716,8 +740,8 @@ fn links_front(files: &[S]) -> LinksFront {
                 if a.is_empty() || b.is_empty() {
                     return;
                 }
-                let ka = key(a);
-                let kb = key(b);
+                let ka = ukey(a);
+                let kb = ukey(b);
                 out[ka.part()].push((ka, 2 * n, a));
                 out[kb.part()].push((kb, 2 * n + 1, b));
                 n += 1;
@@ -732,7 +756,7 @@ fn links_front(files: &[S]) -> LinksFront {
     }
     let npairs = base[per_task.len()] as usize;
     // Rebase side keys to global pair numbers, then transpose to partitions.
-    let tasks: Vec<Vec<Vec<(K, u32, S)>>> = per_task
+    let tasks: Vec<Vec<Vec<(U, u32, S)>>> = per_task
         .into_iter()
         .enumerate()
         .map(|(t, (_, mut v))| {
@@ -749,12 +773,12 @@ fn links_front(files: &[S]) -> LinksFront {
         .collect();
     lp!("rebased");
     // Intern each partition.
-    let interned: Vec<(HashTable<u32>, Vec<K>, Vec<S>, Vec<(u32, u32)>)> = transpose(tasks)
+    let interned: Vec<(HashTable<u32>, Vec<U>, Vec<S>, Vec<(u32, u32)>)> = transpose(tasks)
         .into_par_iter()
         .map(|vs| {
             let n: usize = vs.iter().map(|v| v.len()).sum();
             let mut table: HashTable<u32> = HashTable::with_capacity(n);
-            let mut ids: Vec<K> = Vec::with_capacity(n);
+            let mut ids: Vec<U> = Vec::with_capacity(n);
             let mut strs: Vec<S> = Vec::with_capacity(n);
             let mut assign = Vec::with_capacity(n);
             for v in vs {
@@ -787,7 +811,7 @@ fn links_front(files: &[S]) -> LinksFront {
             side[k as usize] = offs[b] + id;
         }
     }
-    let mut all: Vec<(K, S)> = Vec::with_capacity(nids);
+    let mut all: Vec<(U, S)> = Vec::with_capacity(nids);
     for x in &interned {
         all.extend(x.1.iter().copied().zip(x.2.iter().copied()));
     }
@@ -881,7 +905,7 @@ const K_PURCHASE: u8 = 3;
 /// Its event id and ingest_ts live in its dedup entry (`DE`), not here.
 #[derive(Clone, Copy)]
 struct Ev {
-    user: K,
+    user: U,
     user_s: PS,
     /// ts in ms relative to window_start (valid copies only).
     ts: u32,
@@ -894,7 +918,7 @@ struct Ev {
 #[derive(Clone, Copy)]
 struct UEv {
     /// The user key (meaningful only when `pid == NO_PID`).
-    who: K,
+    who: U,
     /// Dense linked-person id (`part << 24 | index`), or NO_PID if the user is
     /// in no link and is a person on its own.
     pid: u32,
@@ -909,7 +933,7 @@ struct UEv {
 /// A valid click keyed by its user (then by its person).
 #[derive(Clone, Copy)]
 struct UCk {
-    who: K,
+    who: U,
     ts: i64,
     cid: PS,
     camp: u32,
@@ -1004,7 +1028,7 @@ fn parse_events(_ci: usize, c: &Chunk, ctx: &Ctx) -> ParsedChunk {
                         None => kind = 0,
                     }
                 }
-                let user = if kind != 0 { key(user_s) } else { K::default() };
+                let user = if kind != 0 { ukey(user_s) } else { U(0) };
                 let ek = key(eid);
                 if exp == 2 {
                     std::hint::black_box((ek, user, ts, price, cat, kind, ingest));
@@ -1120,7 +1144,7 @@ fn route_events(recs: &[Vec<Ev>], off: &[u32], lost: &[AtomicU64], links: &Links
     let total: usize = recs.iter().map(|r| r.len()).sum();
     let mut out: Vec<Vec<UEv>> = new_parts(total / NPART + total / (NPART * 8) + 16);
     const B: usize = 32;
-    let dummy = Ev { user: K(0, 0), user_s: PS::new(&[]), ts: 0, price: 0, cat: 0, kind: 0 };
+    let dummy = Ev { user: U(0), user_s: PS::new(&[]), ts: 0, price: 0, cat: 0, kind: 0 };
     let mut batch: [&Ev; B] = [&dummy; B];
     let mut nb = 0;
     let emit = |batch: &[&Ev], out: &mut Vec<Vec<UEv>>| {
@@ -1194,7 +1218,7 @@ fn parse_clicks(c: &Chunk, ctx: &Ctx, links: &Links) -> Vec<Vec<UCk>> {
                     Some(&c) => c,
                     None => return,
                 };
-                let k = key(user);
+                let k = ukey(user);
                 links.prefetch(k);
                 buf.push(UCk { who: k, ts, cid: PS::new(cid), camp, pid: NO_PID });
                 if buf.len() == B {
@@ -1401,13 +1425,13 @@ fn process_partition(part: usize, evs: Vec<Vec<UEv>>, cks: Vec<Vec<UCk>>, ctx: &
     let lnames = &links.names[part];
     let mut lmap: Vec<u32> = vec![u32::MAX; lnames.len()];
     let mut names: Vec<S> = Vec::new();
-    let mut ukeys: Vec<K> = Vec::new();
+    let mut ukeys: Vec<U> = Vec::new();
     let mut cnt: Vec<u32> = Vec::new();
     let mut table: HashTable<u32> = HashTable::with_capacity(n / 8 + 16);
     // (local person id, event) in arrival order: the fill below then reads one
     // compact sequential array instead of the routed records again.
     let mut tmp: Vec<(u32, E2)> = Vec::with_capacity(n);
-    let mut last: (K, u32) = (K(u64::MAX, u64::MAX), u32::MAX);
+    let mut last: (U, u32) = (U(u64::MAX), u32::MAX);
     for v in &evs {
         for e in v {
             let id = if e.pid != NO_PID {
@@ -1416,7 +1440,7 @@ fn process_partition(part: usize, evs: Vec<Vec<UEv>>, cks: Vec<Vec<UCk>>, ctx: &
                 if *m == u32::MAX {
                     *m = names.len() as u32;
                     names.push(lnames[li]);
-                    ukeys.push(K(0, 0));
+                    ukeys.push(U(0));
                     cnt.push(0);
                 }
                 *m
@@ -1881,9 +1905,9 @@ mod tests {
 }
 
 // Record sizes are part of the performance design; keep them from growing.
-const _: () = assert!(std::mem::size_of::<UCk>() == 40);
+const _: () = assert!(std::mem::size_of::<UCk>() == 32);
 const _: () = assert!(std::mem::size_of::<C2>() == 24);
-const _: () = assert!(std::mem::size_of::<Ev>() == 40);
+const _: () = assert!(std::mem::size_of::<Ev>() == 32);
 const _: () = assert!(std::mem::size_of::<DE>() == 16);
-const _: () = assert!(std::mem::size_of::<UEv>() == 40);
+const _: () = assert!(std::mem::size_of::<UEv>() == 32);
 const _: () = assert!(std::mem::size_of::<E2>() == 12);
