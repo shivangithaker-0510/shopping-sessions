@@ -222,7 +222,9 @@ impl TsCache {
         let lo = u64::from_le_bytes(s[0..8].try_into().unwrap());
         let hi = u16::from_le_bytes([s[8], s[9]]);
         let key = (lo as u128) | ((hi as u128) << 64);
-        let slot = ((lo >> 40) as usize ^ (hi as usize) * 7) & (TC_SLOTS - 1);
+        // Month and day bytes, mixed so every distinct date in a window spreads.
+        let h = ((lo >> 40) ^ ((hi as u64) << 24)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let slot = (h >> 58) as usize & (TC_SLOTS - 1);
         let days = if self.keys[slot] == key {
             self.days[slot]
         } else {

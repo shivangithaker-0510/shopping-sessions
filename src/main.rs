@@ -97,6 +97,8 @@ macro_rules! log {
     };
 }
 
+/// Experiment switch (SS_EXP), for local profiling only.
+static EXP: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 static PROF: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 const PROF_NAMES: [&str; 8] = ["links", "parse_ev", "dedup", "parse_ck", "dedup_tab", "group", "sort", "person"];
 #[inline]
@@ -373,14 +375,25 @@ fn new_parts<T>(cap: usize) -> Vec<Vec<T>> {
 
 // ---------------------------------------------------------------- links
 
-/// Every linked ID -> its person's name, as a flat open-addressing table split
-/// into one region per partition (so regions build in parallel). Lookups can
-/// be prefetched in batches.
+/// One slot of the link table: an ID key and its person's key (the key of
+/// the person's name), in one 32-byte aligned cache line. An empty slot has
+/// `p == K(0, 0)`.
+#[derive(Clone, Copy, Default)]
+#[repr(C, align(32))]
+struct Slot {
+    k: K,
+    p: K,
+}
+
+/// Every linked ID -> its person, as a flat open-addressing table split into
+/// one region per partition (so regions build in parallel). One cache miss per
+/// lookup, and lookups can be prefetched in batches. Person names are looked
+/// up separately, once per person, in `names`.
 struct Links {
     rbits: u32,
-    keys: Vec<K>,
-    gid: Vec<u32>, // u32::MAX = empty slot; else index into `names` of the person's name
-    names: Vec<(K, S)>,
+    slots: Vec<Slot>,
+    /// Linked person key -> name, for every linked person.
+    names: HashTable<(K, S)>,
 }
 
 impl Links {
@@ -393,39 +406,30 @@ impl Links {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             use std::arch::x86_64::*;
-            let s = self.slot(k);
-            _mm_prefetch(self.keys.as_ptr().add(s) as *const i8, _MM_HINT_T0);
-            _mm_prefetch(self.gid.as_ptr().add(s) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(self.slots.as_ptr().add(self.slot(k)) as *const i8, _MM_HINT_T0);
         }
     }
+    /// The person key of a linked ID, or None if the ID is in no link.
     #[inline(always)]
-    fn prefetch_name(&self, g: u32) {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            use std::arch::x86_64::*;
-            _mm_prefetch(self.names.as_ptr().add(g as usize) as *const i8, _MM_HINT_T0);
-        }
-    }
-    /// Index of the person's name, or u32::MAX if the ID is in no link.
-    #[inline(always)]
-    fn find(&self, k: K) -> u32 {
+    fn find(&self, k: K) -> Option<K> {
         let base = k.part() << self.rbits;
         let m = (1usize << self.rbits) - 1;
         let mut i = k.0 as usize & m;
         loop {
-            let g = self.gid[base | i];
-            if g == u32::MAX || self.keys[base | i] == k {
-                return g;
+            let sl = &self.slots[base | i];
+            if sl.p == K(0, 0) {
+                return None;
+            }
+            if sl.k == k {
+                return Some(sl.p);
             }
             i = (i + 1) & m;
         }
     }
+    /// Name of a linked person (by person key).
     #[inline]
-    fn person(&self, k: K) -> Option<(K, S)> {
-        match self.find(k) {
-            u32::MAX => None,
-            g => Some(self.names[g as usize]),
-        }
+    fn name(&self, p: K) -> S {
+        self.names.find(p.h(), |x| x.0 == p).expect("linked person without a name").1
     }
 }
 
@@ -552,23 +556,26 @@ fn build_links(files: &[S]) -> Links {
     let maxr = interned.iter().map(|x| x.1.len()).max().unwrap_or(0);
     let rbits = ((maxr * 2).max(2)).next_power_of_two().trailing_zeros();
     let rsize = 1usize << rbits;
-    let mut keys = vec![K::default(); rsize * NPART];
-    let mut gid = vec![u32::MAX; rsize * NPART];
-    keys.par_chunks_mut(rsize)
-        .zip(gid.par_chunks_mut(rsize))
-        .zip(interned.par_iter())
-        .enumerate()
-        .for_each(|(b, ((kr, gr), x))| {
-            for (i, &k) in x.1.iter().enumerate() {
-                let mut j = k.0 as usize & (rsize - 1);
-                while gr[j] != u32::MAX {
-                    j = (j + 1) & (rsize - 1);
-                }
-                kr[j] = k;
-                gr[j] = best[root[offs[b] as usize + i] as usize];
+    let mut slots = vec![Slot::default(); rsize * NPART];
+    slots.par_chunks_mut(rsize).zip(interned.par_iter()).enumerate().for_each(|(b, (reg, x))| {
+        for (i, &k) in x.1.iter().enumerate() {
+            let mut j = k.0 as usize & (rsize - 1);
+            while reg[j].p != K(0, 0) {
+                j = (j + 1) & (rsize - 1);
             }
-        });
-    Links { rbits, keys, gid, names: all }
+            let p = all[best[root[offs[b] as usize + i] as usize] as usize].0;
+            assert!(p != K(0, 0), "zero person key");
+            reg[j] = Slot { k, p };
+        }
+    });
+    let mut names: HashTable<(K, S)> = HashTable::with_capacity(nids / 2 + 16);
+    for i in 0..nids {
+        if root[i] == i as u32 {
+            let nm = all[best[i] as usize];
+            names.insert_unique(nm.0.h(), nm, |x| x.0.h());
+        }
+    }
+    Links { rbits, slots, names }
 }
 
 // ---------------------------------------------------------------- events & clicks
@@ -592,11 +599,13 @@ struct Ev {
 #[derive(Clone, Copy)]
 struct UEv {
     who: K,
+    /// The event's own user string (the person's name unless `linked`).
     who_s: PS,
     ts: i64,
     price: u32,
     cat: u16,
     kind: u8,
+    linked: bool,
 }
 
 /// A valid click keyed by its user (then by its person).
@@ -624,6 +633,14 @@ fn parse_events(c: &Chunk, ctx: &Ctx) -> Vec<Vec<Ev>> {
     let mut out: Vec<Vec<Ev>> = new_parts(c.data.len() / 72 / NPART + 4);
     let m = c.map;
     let mut tc = TsCache::default();
+    let exp = EXP.load(Relaxed);
+    if exp == 1 {
+        let mut n = 0usize;
+        scan_rows::<7>(c.data, |f| n += f[0].len());
+        std::hint::black_box(n);
+        prof(1, t);
+        return out;
+    }
     scan_rows::<7>(c.data, |f| {
         let eid = f[m[0] as usize];
         if eid.is_empty() {
@@ -662,75 +679,140 @@ fn parse_events(c: &Chunk, ctx: &Ctx) -> Vec<Vec<Ev>> {
         }
         let user = if kind != 0 { key(user_s) } else { K::default() };
         let ek = key(eid);
+        if exp == 2 {
+            std::hint::black_box((ek, user, ts, price, cat, kind, ingest));
+            return;
+        }
         out[ek.part()].push(Ev { eid: ek, user, user_s: PS::new(user_s), ingest: ingest.unwrap_or(i64::MAX), ts, price, cat, kind });
     });
     prof(1, t);
     out
 }
 
+/// One dedup table entry: the low 64 bits of an event-id key and where the
+/// copy that currently wins lives (`vi << 32 | pi`). Probing compares the 64
+/// bits inline; only on a match (a real duplicate, or a 2^-64 near miss) is
+/// the record read to compare the full key and ingest_ts. `loc == u64::MAX`
+/// marks an empty slot.
+#[derive(Clone, Copy)]
+#[repr(C, align(16))]
+struct DE {
+    k0: u64,
+    loc: u64,
+}
+
+const DE_EMPTY: DE = DE { k0: 0, loc: u64::MAX };
+/// `kind` of a copy that lost dedup to another copy of its event.
+const K_LOSER: u8 = 0xFF;
+
+thread_local! {
+    static DEDUP_TABLE: std::cell::RefCell<(Vec<Vec<DE>>, Vec<DE>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
 /// Dedup one event-id partition: the copy with the smallest ingest_ts wins,
-/// before validation. Winners are kept as locations (no copying); valid ones
-/// are resolved to their person and routed by person partition.
-fn dedup_events(parts: Vec<Vec<Ev>>, links: &Links) -> Vec<Vec<UEv>> {
+/// before validation (equal ingest_ts copies are identical, so the first seen
+/// stays). Losing copies are marked in place, then the records are streamed in
+/// order and the valid winners resolved to their person and routed by person
+/// partition.
+fn dedup_events(mut parts: Vec<Vec<Ev>>, links: &Links) -> Vec<Vec<UEv>> {
     let t = Instant::now();
     let n: usize = parts.iter().map(|v| v.len()).sum();
-    let mut win: Vec<(u32, u32)> = Vec::with_capacity(n);
-    let mut table: HashTable<u32> = HashTable::with_capacity(n);
-    {
-        let get = |w: (u32, u32)| &parts[w.0 as usize][w.1 as usize];
+    let mut losers: Vec<(u32, u32)> = Vec::new();
+    if EXP.load(Relaxed) == 3 {
+        let mut x = 0i64;
+        for v in &parts {
+            for e in v {
+                x = x.wrapping_add(e.ingest);
+            }
+        }
+        std::hint::black_box(x);
+        prof(4, t);
+        return new_parts(0);
+    }
+    // Split into SUB buckets by the key's top bits (streaming writes), then
+    // dedup each bucket with a table small enough to stay in L2.
+    const SUB: usize = 16;
+    DEDUP_TABLE.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        let (buckets, table) = &mut *scratch;
+        buckets.resize_with(SUB, Vec::new);
+        for b in buckets.iter_mut() {
+            b.clear();
+            b.reserve(n / SUB + n / (SUB * 4) + 16);
+        }
         for (vi, v) in parts.iter().enumerate() {
             for (pi, e) in v.iter().enumerate() {
-                let loc = (vi as u32, pi as u32);
-                match table.entry(e.eid.h(), |&i| get(win[i as usize]).eid == e.eid, |&i| get(win[i as usize]).eid.h()) {
-                    Entry::Occupied(o) => {
-                        let i = *o.get() as usize;
-                        if e.ingest < get(win[i]).ingest {
-                            win[i] = loc;
+                buckets[(e.eid.0 >> 60) as usize].push(DE { k0: e.eid.0, loc: (vi as u64) << 32 | pi as u64 });
+            }
+        }
+        for b in buckets.iter() {
+            let cap = (b.len() + b.len() / 3).max(16).next_power_of_two();
+            let mask = cap - 1;
+            table.clear();
+            table.resize(cap, DE_EMPTY);
+            for &x in b {
+                let mut i = x.k0 as usize & mask;
+                loop {
+                    let d = table[i];
+                    if d.loc == u64::MAX {
+                        table[i] = x;
+                        break;
+                    }
+                    if d.k0 == x.k0 {
+                        let (wv, wp) = ((d.loc >> 32) as u32, d.loc as u32);
+                        let (vi, pi) = ((x.loc >> 32) as u32, x.loc as u32);
+                        let w = &parts[wv as usize][wp as usize];
+                        let e = &parts[vi as usize][pi as usize];
+                        if w.eid == e.eid {
+                            if e.ingest < w.ingest {
+                                losers.push((wv, wp));
+                                table[i].loc = x.loc;
+                            } else {
+                                losers.push((vi, pi));
+                            }
+                            break;
                         }
                     }
-                    Entry::Vacant(vac) => {
-                        vac.insert(win.len() as u32);
-                        win.push(loc);
-                    }
+                    i = (i + 1) & mask;
                 }
             }
         }
+    });
+    for &(vi, pi) in &losers {
+        parts[vi as usize][pi as usize].kind = K_LOSER;
     }
-    drop(table);
     prof(4, t);
     let mut out: Vec<Vec<UEv>> = new_parts(n / NPART + 4);
     const B: usize = 32;
-    let mut g = [0u32; B];
-    for batch in win.chunks(B) {
-        for &(vi, pi) in batch {
-            let e = &parts[vi as usize][pi as usize];
-            if e.kind != 0 {
-                links.prefetch(e.user);
-            }
+    let dummy = Ev { eid: K(0, 0), user: K(0, 0), user_s: PS::new(&[]), ingest: 0, ts: 0, price: 0, cat: 0, kind: 0 };
+    let mut batch: [&Ev; B] = [&dummy; B];
+    let mut nb = 0;
+    let emit = |batch: &[&Ev], out: &mut Vec<Vec<UEv>>| {
+        for &e in batch {
+            links.prefetch(e.user);
         }
-        for (j, &(vi, pi)) in batch.iter().enumerate() {
-            let e = &parts[vi as usize][pi as usize];
-            if e.kind != 0 {
-                g[j] = links.find(e.user);
-                if g[j] != u32::MAX {
-                    links.prefetch_name(g[j]);
-                }
-            }
+        for &e in batch {
+            let (who, linked) = match links.find(e.user) {
+                Some(p) => (p, true),
+                None => (e.user, false),
+            };
+            out[who.part()].push(UEv { who, who_s: e.user_s, ts: e.ts, price: e.price, cat: e.cat, kind: e.kind, linked });
         }
-        for (j, &(vi, pi)) in batch.iter().enumerate() {
-            let e = &parts[vi as usize][pi as usize];
-            if e.kind == 0 {
+    };
+    for v in &parts {
+        for e in v {
+            if e.kind == 0 || e.kind == K_LOSER {
                 continue;
             }
-            let (nk, ns) = if g[j] == u32::MAX {
-                (e.user, e.user_s)
-            } else {
-                let (k, s) = links.names[g[j] as usize];
-                (k, PS::new(s))
-            };
-            out[nk.part()].push(UEv { who: nk, who_s: ns, ts: e.ts, price: e.price, cat: e.cat, kind: e.kind });
+            batch[nb] = e;
+            nb += 1;
+            if nb == B {
+                emit(&batch, &mut out);
+                nb = 0;
+            }
         }
     }
+    emit(&batch[..nb], &mut out);
     prof(2, t);
     out
 }
@@ -747,17 +829,10 @@ fn parse_clicks(c: &Chunk, ctx: &Ctx, links: &Links) -> Vec<Vec<UCk>> {
     // Valid clicks wait in a small batch so their link lookups can be prefetched.
     const B: usize = 32;
     let mut buf: Vec<UCk> = Vec::with_capacity(B);
-    let mut g = [0u32; B];
-    let flush = |buf: &mut Vec<UCk>, g: &mut [u32; B], out: &mut Vec<Vec<UCk>>| {
-        for (j, c) in buf.iter().enumerate() {
-            g[j] = links.find(c.who);
-            if g[j] != u32::MAX {
-                links.prefetch_name(g[j]);
-            }
-        }
-        for (j, mut c) in buf.drain(..).enumerate() {
-            if g[j] != u32::MAX {
-                c.who = links.names[g[j] as usize].0;
+    let flush = |buf: &mut Vec<UCk>, out: &mut Vec<Vec<UCk>>| {
+        for mut c in buf.drain(..) {
+            if let Some(p) = links.find(c.who) {
+                c.who = p;
             }
             out[c.who.part()].push(c);
         }
@@ -780,10 +855,10 @@ fn parse_clicks(c: &Chunk, ctx: &Ctx, links: &Links) -> Vec<Vec<UCk>> {
         links.prefetch(k);
         buf.push(UCk { who: k, ts, cid, camp });
         if buf.len() == B {
-            flush(&mut buf, &mut g, &mut out);
+            flush(&mut buf, &mut out);
         }
     });
-    flush(&mut buf, &mut g, &mut out);
+    flush(&mut buf, &mut out);
     prof(3, t);
     out
 }
@@ -962,7 +1037,7 @@ fn person(name: S, es: &[E2], cs: &[C2], ctx: &Ctx, rank: &[u32], acc: &mut Camp
     }
 }
 
-fn process_partition(evs: Vec<Vec<UEv>>, cks: Vec<Vec<UCk>>, ctx: &Ctx, rank: &[u32], acc: &mut CampAcc) -> Vec<URow> {
+fn process_partition(evs: Vec<Vec<UEv>>, cks: Vec<Vec<UCk>>, ctx: &Ctx, links: &Links, rank: &[u32], acc: &mut CampAcc) -> Vec<URow> {
     let t = Instant::now();
     let n: usize = evs.iter().map(|v| v.len()).sum();
     let mut rows = Vec::new();
@@ -985,7 +1060,7 @@ fn process_partition(evs: Vec<Vec<UEv>>, cks: Vec<Vec<UCk>>, ctx: &Ctx, rank: &[
                     Entry::Vacant(vac) => {
                         let id = names.len() as u32;
                         vac.insert(id);
-                        names.push((e.who, e.who_s.get()));
+                        names.push((e.who, if e.linked { links.name(e.who) } else { e.who_s.get() }));
                         cnt.push(0);
                         id
                     }
@@ -1082,6 +1157,7 @@ fn manifest_ts(text: &str, key: &str) -> i64 {
 
 fn main() {
     let t0 = Instant::now();
+    EXP.store(std::env::var("SS_EXP").ok().and_then(|v| v.parse().ok()).unwrap_or(0), Relaxed);
     if let Ok(mb) = std::env::var("FAULTBENCH") {
         let mb: usize = mb.parse().unwrap();
         let threads: usize = std::env::var("FB_THREADS").ok().and_then(|x| x.parse().ok()).unwrap_or(1);
@@ -1219,6 +1295,10 @@ fn main() {
         || ev_chunks.par_iter().map(|c| parse_events(c, &ctx)).collect::<Vec<_>>(),
     );
     log!(t0, "links built, events parsed ({} chunks)", ev_chunks.len());
+    if EXP.load(Relaxed) != 0 && EXP.load(Relaxed) != 3 {
+        eprintln!("cpu seconds: {}", prof_report());
+        std::process::exit(0);
+    }
     let (ev_by_person, ck_by_person) = rayon::join(
         || transpose(ev_parsed).into_par_iter().map(|p| dedup_events(p, &links)).collect::<Vec<_>>(),
         || ck_chunks.par_iter().map(|c| parse_clicks(c, &ctx, &links)).collect::<Vec<_>>(),
@@ -1232,7 +1312,7 @@ fn main() {
         .fold(
             || (Vec::new(), CampAcc::new(&ctx)),
             |(mut users, mut acc), (evs, cks)| {
-                users.push(process_partition(evs, cks, &ctx, &rank, &mut acc));
+                users.push(process_partition(evs, cks, &ctx, &links, &rank, &mut acc));
                 (users, acc)
             },
         )
