@@ -696,10 +696,20 @@ fn pack_ingest(ms: i64, base: i64) -> u32 {
     (ms.div_euclid(1000) - base).clamp(0, u32::MAX as i64 - 1) as u32
 }
 
-fn parse_events(c: &Chunk, ctx: &Ctx) -> Vec<Vec<Ev>> {
+/// Parsed events of one chunk: every copy's record, in file order, and a
+/// compact (key hash, location) entry per copy, scattered by event-id
+/// partition for dedup.
+struct ParsedChunk {
+    recs: Vec<Ev>,
+    keys: Vec<Vec<DE>>,
+}
+
+fn parse_events(ci: usize, c: &Chunk, ctx: &Ctx) -> ParsedChunk {
     let t = Instant::now();
     let emask = ctx.epart - 1;
-    let mut out: Vec<Vec<Ev>> = (0..ctx.epart).map(|_| Vec::with_capacity(c.data.len() / 72 / ctx.epart + 4)).collect();
+    let mut recs: Vec<Ev> = Vec::with_capacity(c.data.len() / 64 + 16);
+    let mut keys: Vec<Vec<DE>> = (0..ctx.epart).map(|_| Vec::with_capacity(c.data.len() / 72 / ctx.epart + 4)).collect();
+    let cbase = (ci as u64) << 32;
     let m = c.map;
     let mut tc = TsCache::default();
     let exp = EXP.load(Relaxed);
@@ -708,7 +718,7 @@ fn parse_events(c: &Chunk, ctx: &Ctx) -> Vec<Vec<Ev>> {
         scan_rows::<7>(c.data, |f| n += f[0].len());
         std::hint::black_box(n);
         prof(1, t);
-        return out;
+        return ParsedChunk { recs, keys };
     }
     scan_rows::<7>(c.data, |f| {
         let eid = f[m[0] as usize];
@@ -767,10 +777,12 @@ fn parse_events(c: &Chunk, ctx: &Ctx) -> Vec<Vec<Ev>> {
             Some(x) => pack_ingest(x, ctx.ingest_base),
             None => u32::MAX,
         };
-        out[(ek.h() >> 40) as usize & emask].push(Ev { eid: ek, user, user_s: PS::new(user_s), ingest, ts, price, cat, kind });
+        let h = ek.h();
+        keys[(h >> 40) as usize & emask].push(DE { k0: h, loc: cbase | recs.len() as u64 });
+        recs.push(Ev { eid: ek, user, user_s: PS::new(user_s), ingest, ts, price, cat, kind });
     });
     prof(1, t);
-    out
+    ParsedChunk { recs, keys }
 }
 
 /// One dedup table entry: the 64-bit mix of an event-id key and where the
@@ -786,8 +798,6 @@ struct DE {
 }
 
 const DE_EMPTY: DE = DE { k0: 0, loc: u64::MAX };
-/// `kind` of a copy that lost dedup to another copy of its event.
-const K_LOSER: u8 = 0xFF;
 
 thread_local! {
     static DEDUP_TABLE: std::cell::RefCell<(Vec<Vec<DE>>, Vec<DE>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
@@ -798,24 +808,17 @@ thread_local! {
 /// stays). Losing copies are marked in place, then the records are streamed in
 /// order and the valid winners resolved to their person and routed by person
 /// partition.
-fn dedup_events(mut parts: Vec<Vec<Ev>>, links: &Links) -> Vec<Vec<UEv>> {
+fn dedup_events(parts: Vec<Vec<DE>>, recs: &[Vec<Ev>], losers: &[Vec<AtomicU64>]) {
     let t = Instant::now();
     let n: usize = parts.iter().map(|v| v.len()).sum();
-    let mut losers: Vec<(u32, u32)> = Vec::new();
-    if EXP.load(Relaxed) == 3 {
-        let mut x = 0i64;
-        for v in &parts {
-            for e in v {
-                x = x.wrapping_add(e.ingest as i64);
-            }
-        }
-        std::hint::black_box(x);
-        prof(4, t);
-        return new_parts(0);
-    }
-    // Split into SUB buckets by the key's top bits (streaming writes), then
-    // dedup each bucket with a table small enough to stay in L2.
-    // About 4096 entries per bucket: a 64 KiB table, L2-resident.
+    let rec = |loc: u64| &recs[(loc >> 32) as usize][loc as u32 as usize];
+    let lose = |loc: u64| {
+        let i = loc as u32 as usize;
+        losers[(loc >> 32) as usize][i >> 6].fetch_or(1u64 << (i & 63), Relaxed);
+    };
+    // Split into sub-buckets by the hash's top bits (streaming writes), then
+    // dedup each bucket with a table small enough to stay in L2 (about 4096
+    // entries, 64 KiB).
     let sub_bits = (n / 4096).max(1).next_power_of_two().trailing_zeros().min(12);
     let sub = 1usize << sub_bits;
     DEDUP_TABLE.with(|cell| {
@@ -827,10 +830,9 @@ fn dedup_events(mut parts: Vec<Vec<Ev>>, links: &Links) -> Vec<Vec<UEv>> {
             b.clear();
             b.reserve(n / sub + n / (sub * 4) + 16);
         }
-        for (vi, v) in parts.iter().enumerate() {
-            for (pi, e) in v.iter().enumerate() {
-                let h = e.eid.h();
-                buckets[if sub_bits == 0 { 0 } else { (h >> (64 - sub_bits)) as usize }].push(DE { k0: h, loc: (vi as u64) << 32 | pi as u64 });
+        for v in &parts {
+            for &x in v {
+                buckets[if sub_bits == 0 { 0 } else { (x.k0 >> (64 - sub_bits)) as usize }].push(x);
             }
         }
         for b in buckets.iter() {
@@ -847,16 +849,14 @@ fn dedup_events(mut parts: Vec<Vec<Ev>>, links: &Links) -> Vec<Vec<UEv>> {
                         break;
                     }
                     if d.k0 == x.k0 {
-                        let (wv, wp) = ((d.loc >> 32) as u32, d.loc as u32);
-                        let (vi, pi) = ((x.loc >> 32) as u32, x.loc as u32);
-                        let w = &parts[wv as usize][wp as usize];
-                        let e = &parts[vi as usize][pi as usize];
+                        let (w, e) = (rec(d.loc), rec(x.loc));
                         if w.eid == e.eid {
+                            // Smallest ingest_ts wins; equal ones are identical copies.
                             if e.ingest < w.ingest {
-                                losers.push((wv, wp));
+                                lose(d.loc);
                                 table[i].loc = x.loc;
                             } else {
-                                losers.push((vi, pi));
+                                lose(x.loc);
                             }
                             break;
                         }
@@ -866,11 +866,14 @@ fn dedup_events(mut parts: Vec<Vec<Ev>>, links: &Links) -> Vec<Vec<UEv>> {
             }
         }
     });
-    for &(vi, pi) in &losers {
-        parts[vi as usize][pi as usize].kind = K_LOSER;
-    }
     prof(4, t);
-    let mut out: Vec<Vec<UEv>> = new_parts(n / NPART + 4);
+}
+
+/// Routes one chunk's surviving events (valid, and not a dedup loser) to their
+/// person partition, in file order; link lookups are prefetched in batches.
+fn route_events(recs: &[Ev], lost: &[AtomicU64], links: &Links) -> Vec<Vec<UEv>> {
+    let t = Instant::now();
+    let mut out: Vec<Vec<UEv>> = new_parts(recs.len() / NPART + 8);
     const B: usize = 32;
     let dummy = Ev { eid: K(0, 0), user: K(0, 0), user_s: PS::new(&[]), ingest: 0, ts: 0, price: 0, cat: 0, kind: 0 };
     let mut batch: [&Ev; B] = [&dummy; B];
@@ -885,9 +888,10 @@ fn dedup_events(mut parts: Vec<Vec<Ev>>, links: &Links) -> Vec<Vec<UEv>> {
             out[part].push(UEv { who: e.user, pid, who_s: e.user_s, ts: e.ts, price: e.price, cat: e.cat, kind: e.kind });
         }
     };
-    for v in &parts {
-        for e in v {
-            if e.kind == 0 || e.kind == K_LOSER {
+    for (w, block) in recs.chunks(64).enumerate() {
+        let lw = lost[w].load(Relaxed);
+        for (j, e) in block.iter().enumerate() {
+            if e.kind == 0 || (lw >> j) & 1 == 1 {
                 continue;
             }
             batch[nb] = e;
@@ -1316,7 +1320,7 @@ fn main() {
             let ctx = Ctx { epart: EPART_DEFAULT, ws: 0, ingest_base: 0, we: i64::MAX, products: HashMap::new(), campaigns: HashMap::new(), unknown_cat: 0, ncamp: 0, day0: 0, ndays: 1 };
             let t = Instant::now();
             let mut m = 0usize;
-            for c in &chunks { m += parse_events(c, &ctx).iter().map(|v| v.len()).sum::<usize>(); }
+            for (ci, c) in chunks.iter().enumerate() { m += parse_events(ci, c, &ctx).recs.len(); }
             let d = t.elapsed();
             eprintln!("round {round}: {} MB, {} rows | scan {:?} ({:.0} MB/s) | scan+2 hashes {:?} | scan+2 ts {:?} | parse_events {:?} ({:.0} ns/row) {} {}",
                 bytes >> 20, m, a, bytes as f64 / a.as_secs_f64() / 1e6, b, c2, d, d.as_nanos() as f64 / m as f64, n, h as u8 as i64 + z % 2);
@@ -1406,15 +1410,20 @@ fn main() {
             prof(0, t);
             l
         },
-        || ev_chunks.par_iter().map(|c| parse_events(c, &ctx)).collect::<Vec<_>>(),
+        || ev_chunks.par_iter().enumerate().map(|(ci, c)| parse_events(ci, c, &ctx)).collect::<Vec<_>>(),
     );
     log!(t0, "links built, events parsed ({} chunks)", ev_chunks.len());
-    if EXP.load(Relaxed) != 0 && EXP.load(Relaxed) != 3 {
+    if EXP.load(Relaxed) != 0 {
         eprintln!("cpu seconds: {}", prof_report());
         std::process::exit(0);
     }
+    let (recs, keys): (Vec<Vec<Ev>>, Vec<Vec<Vec<DE>>>) = ev_parsed.into_iter().map(|p| (p.recs, p.keys)).unzip();
+    let losers: Vec<Vec<AtomicU64>> = recs.iter().map(|r| (0..r.len().div_ceil(64)).map(|_| AtomicU64::new(0)).collect()).collect();
     let (ev_by_person, ck_by_person) = rayon::join(
-        || transpose(ev_parsed).into_par_iter().map(|p| dedup_events(p, &links)).collect::<Vec<_>>(),
+        || {
+            transpose(keys).into_par_iter().for_each(|p| dedup_events(p, &recs, &losers));
+            recs.par_iter().zip(losers.par_iter()).map(|(r, l)| route_events(r, l, &links)).collect::<Vec<_>>()
+        },
         || ck_chunks.par_iter().map(|c| parse_clicks(c, &ctx, &links)).collect::<Vec<_>>(),
     );
     let (re, rc) = (ev_by_person, ck_by_person);
