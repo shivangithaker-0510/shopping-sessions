@@ -45,26 +45,59 @@ const EPART_DEFAULT: usize = 256;
 /// Target size of one parse task.
 const CHUNK: usize = 4 << 20;
 
-/// A 128-bit ID key (two u64 halves keep the alignment at 8).
+/// An ID as a 128-bit key (two u64 halves keep the alignment at 8).
+///
+/// IDs of up to 15 bytes are stored verbatim: their bytes, with the length in
+/// the top byte, so two different short IDs can never get the same key. The
+/// generator makes 7 in 8 IDs short (base 36). Longer IDs are xxh3-128 hashed
+/// with the top byte forced to 0xFF, so they never equal a short-ID key. Keys
+/// are compared whole for identity; `mix` spreads them for tables and
+/// partitions.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub struct K(u64, u64);
 
-#[inline]
+#[inline(always)]
 fn key(s: &[u8]) -> K {
-    let h = xxh3_128(s);
-    K(h as u64, (h >> 64) as u64)
+    let n = s.len();
+    if n > 15 {
+        let h = xxh3_128(s);
+        return K(h as u64, ((h >> 64) as u64) | (0xFF << 56));
+    }
+    let (lo, hi) = if n >= 8 {
+        let a = u64::from_le_bytes(s[0..8].try_into().unwrap());
+        let b = u64::from_le_bytes(s[n - 8..n].try_into().unwrap());
+        // Bytes 8..n are the top n-8 bytes of b.
+        (a, b.checked_shr(8 * (16 - n as u32)).unwrap_or(0))
+    } else if n >= 4 {
+        let a = u32::from_le_bytes(s[0..4].try_into().unwrap()) as u64;
+        let b = u32::from_le_bytes(s[n - 4..n].try_into().unwrap()) as u64;
+        // Bytes 4..n are the top n-4 bytes of b.
+        (a | ((b >> (8 * (8 - n as u32))) << 32), 0)
+    } else if n > 0 {
+        (s[0] as u64 | (s[n / 2] as u64) << 8 | (s[n - 1] as u64) << 16, 0)
+    } else {
+        (0, 0)
+    };
+    K(lo, hi | (n as u64) << 56)
 }
 
 impl K {
-    /// Hash for hashbrown: low bits pick the slot, top 7 bits are the tag.
-    #[inline]
-    fn h(self) -> u64 {
-        self.0
+    /// A well-spread 64-bit hash of the key (folded 128-bit multiply).
+    #[inline(always)]
+    fn mix(self) -> u64 {
+        let p = ((self.0 ^ 0x243F_6A88_85A3_08D3) as u128) * ((self.1 ^ 0x1319_8A2E_0370_7344) as u128);
+        (p as u64) ^ ((p >> 64) as u64)
     }
-    /// Partition from bits hashbrown does not lean on.
-    #[inline]
+    /// Hash for hash tables.
+    #[inline(always)]
+    fn h(self) -> u64 {
+        self.mix()
+    }
+    /// Partition, from bits that table slots (low bits) and hashbrown tags
+    /// (top 7 bits) do not use.
+    #[inline(always)]
     fn part(self) -> usize {
-        (self.1 as usize) & (NPART - 1)
+        (self.mix() >> 40) as usize & (NPART - 1)
     }
 }
 
@@ -420,7 +453,7 @@ struct Links {
 impl Links {
     #[inline(always)]
     fn slot(&self, k: K) -> usize {
-        (k.part() << self.rbits) | (k.0 as usize & ((1 << self.rbits) - 1))
+        (k.part() << self.rbits) | (k.h() as usize & ((1 << self.rbits) - 1))
     }
     #[inline(always)]
     fn prefetch(&self, k: K) {
@@ -435,7 +468,7 @@ impl Links {
     fn find(&self, k: K) -> u32 {
         let base = k.part() << self.rbits;
         let m = (1usize << self.rbits) - 1;
-        let mut i = k.0 as usize & m;
+        let mut i = k.h() as usize & m;
         loop {
             let sl = &self.slots[base | i];
             if sl.pid == NO_PID || sl.k == k {
@@ -585,7 +618,7 @@ fn build_links(files: &[S]) -> Links {
     let mut slots = vec![SLOT_EMPTY; rsize * NPART];
     slots.par_chunks_mut(rsize).zip(interned.par_iter()).enumerate().for_each(|(b, (reg, x))| {
         for (i, &k) in x.1.iter().enumerate() {
-            let mut j = k.0 as usize & (rsize - 1);
+            let mut j = k.h() as usize & (rsize - 1);
             while reg[j].pid != NO_PID {
                 j = (j + 1) & (rsize - 1);
             }
@@ -734,13 +767,13 @@ fn parse_events(c: &Chunk, ctx: &Ctx) -> Vec<Vec<Ev>> {
             Some(x) => pack_ingest(x, ctx.ingest_base),
             None => u32::MAX,
         };
-        out[(ek.1 >> 32) as usize & emask].push(Ev { eid: ek, user, user_s: PS::new(user_s), ingest, ts, price, cat, kind });
+        out[(ek.h() >> 40) as usize & emask].push(Ev { eid: ek, user, user_s: PS::new(user_s), ingest, ts, price, cat, kind });
     });
     prof(1, t);
     out
 }
 
-/// One dedup table entry: the low 64 bits of an event-id key and where the
+/// One dedup table entry: the 64-bit mix of an event-id key and where the
 /// copy that currently wins lives (`vi << 32 | pi`). Probing compares the 64
 /// bits inline; only on a match (a real duplicate, or a 2^-64 near miss) is
 /// the record read to compare the full key and ingest_ts. `loc == u64::MAX`
@@ -796,7 +829,8 @@ fn dedup_events(mut parts: Vec<Vec<Ev>>, links: &Links) -> Vec<Vec<UEv>> {
         }
         for (vi, v) in parts.iter().enumerate() {
             for (pi, e) in v.iter().enumerate() {
-                buckets[if sub_bits == 0 { 0 } else { (e.eid.0 >> (64 - sub_bits)) as usize }].push(DE { k0: e.eid.0, loc: (vi as u64) << 32 | pi as u64 });
+                let h = e.eid.h();
+                buckets[if sub_bits == 0 { 0 } else { (h >> (64 - sub_bits)) as usize }].push(DE { k0: h, loc: (vi as u64) << 32 | pi as u64 });
             }
         }
         for b in buckets.iter() {
@@ -1435,6 +1469,49 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_keys_are_exact() {
+        let mut seen = std::collections::HashMap::new();
+        let alphabet = b"ab0\"z\x00\xff";
+        // Every string of length 0..=5 over a small alphabet, plus longer ones.
+        let mut all: Vec<Vec<u8>> = vec![vec![]];
+        for _ in 0..5 {
+            let last: Vec<Vec<u8>> = all.iter().filter(|v| v.len() == all.last().unwrap().len()).cloned().collect();
+            for v in last {
+                for &c in alphabet {
+                    let mut w = v.clone();
+                    w.push(c);
+                    all.push(w);
+                }
+            }
+        }
+        let mut seed = 7u64;
+        for n in 6..=40 {
+            for _ in 0..3000 {
+                let v: Vec<u8> = (0..n)
+                    .map(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        alphabet[(seed % alphabet.len() as u64) as usize]
+                    })
+                    .collect();
+                all.push(v);
+            }
+        }
+        for v in all {
+            let k = key(&v);
+            if let Some(prev) = seen.insert((k.0, k.1), v.clone()) {
+                assert_eq!(prev, v, "two IDs share a key");
+            }
+            if v.len() <= 15 {
+                assert_eq!(k.1 >> 56, v.len() as u64);
+            } else {
+                assert_eq!(k.1 >> 56, 0xFF);
+            }
+        }
+    }
 
     fn rows<const N: usize>(s: &'static [u8]) -> Vec<Vec<&'static [u8]>> {
         let mut v = Vec::new();
