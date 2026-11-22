@@ -762,7 +762,7 @@ fn parse_events(ci: usize, c: &Chunk, ctx: &Ctx) -> ParsedChunk {
     let mut keys: Vec<Vec<DE>> = (0..ctx.epart).map(|_| Vec::with_capacity(c.data.len() / 72 / ctx.epart + 4)).collect();
     let cbase = (ci as u64) << 32;
     let m = c.map;
-    let mut tc = TsCache::default();
+    let mut tc = TsCache::new();
     let exp = EXP.load(Relaxed);
     if exp == 1 {
         let mut n = 0usize;
@@ -771,67 +771,69 @@ fn parse_events(ci: usize, c: &Chunk, ctx: &Ctx) -> ParsedChunk {
         prof(1, t);
         return ParsedChunk { recs, keys };
     }
-    scan_rows::<7>(c.data, |f| {
-        let eid = f[m[0] as usize];
-        if eid.is_empty() {
-            return;
-        }
-        let ingest = if exp == 7 { Some(ctx.ws) } else { tc.parse(f[m[3] as usize]) };
-        let mut kind = match f[m[4] as usize] {
-            b"view" => 1,
-            b"cart" => 2,
-            b"purchase" => K_PURCHASE,
-            _ => 0,
-        };
-        let user_s = f[m[1] as usize];
-        let product = f[m[5] as usize];
-        let mut ts = 0u32;
-        let mut price = 0;
-        let mut cat = 0;
-        if kind != 0 && (ingest.is_none() || user_s.is_empty() || product.is_empty()) {
-            kind = 0;
-        }
-        if kind != 0 {
-            match if exp == 6 { Some(ctx.ws) } else { tc.parse(f[m[2] as usize]) } {
-                // Late: ingest_ts - ts over 24 h. (ts is in the window, no overflow.)
-                Some(t) if t >= ctx.ws && t < ctx.we && ingest.unwrap() - t <= DAY => ts = (t - ctx.ws) as u32,
-                _ => kind = 0,
-            }
-        }
-        if kind == K_PURCHASE {
-            match parse_price(f[m[6] as usize]) {
-                Some(p) => {
-                    price = p;
-                    cat = *ctx.products.get(product).unwrap_or(&ctx.unknown_cat);
+    // The row body, instantiated twice: with constant column positions for
+    // the documented header order (every generator file), and through the
+    // column map otherwise.
+    macro_rules! rows {
+        ($col:expr) => {
+            scan_rows::<7>(c.data, |f| {
+                let col = $col;
+                let eid = f[col(0)];
+                if eid.is_empty() {
+                    return;
                 }
-                None => kind = 0,
-            }
-        }
-        let user = if kind != 0 {
-            if exp == 4 { K(user_s.len() as u64, user_s[0] as u64) } else { key(user_s) }
-        } else {
-            K::default()
+                let ingest = tc.parse(f[col(3)]);
+                let mut kind = match f[col(4)] {
+                    b"view" => 1,
+                    b"cart" => 2,
+                    b"purchase" => K_PURCHASE,
+                    _ => 0,
+                };
+                let user_s = f[col(1)];
+                let product = f[col(5)];
+                let mut ts = 0u32;
+                let mut price = 0;
+                let mut cat = 0;
+                if kind != 0 && (ingest.is_none() || user_s.is_empty() || product.is_empty()) {
+                    kind = 0;
+                }
+                if kind != 0 {
+                    match tc.parse(f[col(2)]) {
+                        // Late: ingest_ts - ts over 24 h. (ts is in the window, no overflow.)
+                        Some(t) if t >= ctx.ws && t < ctx.we && ingest.unwrap() - t <= DAY => ts = (t - ctx.ws) as u32,
+                        _ => kind = 0,
+                    }
+                }
+                if kind == K_PURCHASE {
+                    match parse_price(f[col(6)]) {
+                        Some(p) => {
+                            price = p;
+                            cat = *ctx.products.get(product).unwrap_or(&ctx.unknown_cat);
+                        }
+                        None => kind = 0,
+                    }
+                }
+                let user = if kind != 0 { key(user_s) } else { K::default() };
+                let ek = key(eid);
+                if exp == 2 {
+                    std::hint::black_box((ek, user, ts, price, cat, kind, ingest));
+                    return;
+                }
+                let ingest = match ingest {
+                    Some(x) => pack_ingest(x, ctx.ingest_base),
+                    None => u32::MAX,
+                };
+                let h = ek.h();
+                keys[(h >> 40) as usize & emask].push(DE { k0: h, loc: cbase | recs.len() as u64 });
+                recs.push(Ev { eid: ek, user, user_s: PS::new(user_s), ingest, ts, price, cat, kind });
+            })
         };
-        let ek = if exp == 5 {
-            let mut b = [0u8; 8];
-            let n = eid.len().min(8);
-            b[..n].copy_from_slice(&eid[..n]);
-            K(u64::from_le_bytes(b), u64::from_le_bytes(b).rotate_left(29))
-        } else {
-            key(eid)
-        };
-        if exp == 2 {
-            std::hint::black_box((ek, user, ts, price, cat, kind, ingest));
-            return;
-        }
-        let ingest = match ingest {
-            Some(x) => pack_ingest(x, ctx.ingest_base),
-            None => u32::MAX,
-        };
-        let h = ek.h();
-        keys[(h >> 40) as usize & emask].push(DE { k0: h, loc: cbase | recs.len() as u64 });
-        recs.push(Ev { eid: ek, user, user_s: PS::new(user_s), ingest, ts, price, cat, kind });
-    });
+    }
+    if m[..7] == [0, 1, 2, 3, 4, 5, 6] {
+        rows!(|i: usize| i);
+    } else {
+        rows!(|i: usize| m[i] as usize);
+    }
     prof(1, t);
     ParsedChunk { recs, keys }
 }
