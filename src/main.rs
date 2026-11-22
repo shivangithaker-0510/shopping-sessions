@@ -874,13 +874,11 @@ fn links_tail(f: LinksFront) -> Links {
 const K_PURCHASE: u8 = 3;
 
 /// One parsed copy of an event. kind == 0 means the copy fails validation.
+/// Its event id and ingest_ts live in its dedup entry (`DE`), not here.
 #[derive(Clone, Copy)]
 struct Ev {
-    eid: K,
     user: K,
     user_s: PS,
-    /// ingest_ts in whole seconds, relative to `Ctx::ingest_base` (see `pack_ingest`).
-    ingest: u32,
     /// ts in ms relative to window_start (valid copies only).
     ts: u32,
     price: u32,
@@ -938,19 +936,18 @@ fn pack_ingest(ms: i64, base: i64) -> u32 {
 }
 
 /// Parsed events of one chunk: every copy's record, in file order, and a
-/// compact (key hash, location) entry per copy, scattered by event-id
-/// partition for dedup.
+/// dedup entry per copy (event-id key, ingest_ts, row in the chunk),
+/// scattered by event-id partition.
 struct ParsedChunk {
     recs: Vec<Ev>,
     keys: Vec<Vec<DE>>,
 }
 
-fn parse_events(ci: usize, c: &Chunk, ctx: &Ctx) -> ParsedChunk {
+fn parse_events(_ci: usize, c: &Chunk, ctx: &Ctx) -> ParsedChunk {
     let t = Instant::now();
     let emask = ctx.epart - 1;
     let mut recs: Vec<Ev> = Vec::with_capacity(c.data.len() / 64 + 16);
     let mut keys: Vec<Vec<DE>> = (0..ctx.epart).map(|_| Vec::with_capacity(c.data.len() / 72 / ctx.epart + 4)).collect();
-    let cbase = (ci as u64) << 32;
     let m = c.map;
     let mut tc = TsCache::new();
     let exp = EXP.load(Relaxed);
@@ -1014,8 +1011,8 @@ fn parse_events(ci: usize, c: &Chunk, ctx: &Ctx) -> ParsedChunk {
                     None => u32::MAX,
                 };
                 let h = ek.h();
-                keys[(h >> 40) as usize & emask].push(DE { k0: h, loc: cbase | recs.len() as u64 });
-                recs.push(Ev { eid: ek, user, user_s: PS::new(user_s), ingest, ts, price, cat, kind });
+                keys[(h >> 40) as usize & emask].push(DE { k: ek, ingest, row: recs.len() as u32 });
+                recs.push(Ev { user, user_s: PS::new(user_s), ts, price, cat, kind });
             })
         };
     }
@@ -1028,40 +1025,36 @@ fn parse_events(ci: usize, c: &Chunk, ctx: &Ctx) -> ParsedChunk {
     ParsedChunk { recs, keys }
 }
 
-/// One dedup table entry: the 64-bit mix of an event-id key and where the
-/// copy that currently wins lives (`vi << 32 | pi`). Probing compares the 64
-/// bits inline; only on a match (a real duplicate, or a 2^-64 near miss) is
-/// the record read to compare the full key and ingest_ts. `loc == u64::MAX`
-/// marks an empty slot.
+/// One dedup entry: a copy's whole event-id key, its packed ingest_ts, and
+/// its row: within its chunk when parsed, then (inside dedup) its global row
+/// (chunk offset + row). Dedup needs nothing else, so it never touches the
+/// event records. `row == u32::MAX` marks an empty table slot.
 #[derive(Clone, Copy)]
-#[repr(C, align(16))]
 struct DE {
-    k0: u64,
-    loc: u64,
+    k: K,
+    ingest: u32,
+    row: u32,
 }
 
-const DE_EMPTY: DE = DE { k0: 0, loc: u64::MAX };
+const DE_EMPTY: DE = DE { k: K(0, 0), ingest: 0, row: u32::MAX };
 
 thread_local! {
     static DEDUP_TABLE: std::cell::RefCell<(Vec<Vec<DE>>, Vec<DE>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
 }
 
-/// Dedup one event-id partition: the copy with the smallest ingest_ts wins,
-/// before validation (equal ingest_ts copies are identical, so the first seen
-/// stays). Losing copies are marked in place, then the records are streamed in
-/// order and the valid winners resolved to their person and routed by person
-/// partition.
-fn dedup_events(parts: Vec<Vec<DE>>, recs: &[Vec<Ev>], losers: &[Vec<AtomicU64>]) {
+/// Dedup one event-id partition (`parts[ci]` holds chunk ci's entries; `off`
+/// is each chunk's first global row): the copy with the smallest ingest_ts
+/// wins, before validation (equal ingest_ts copies are identical, so the
+/// first seen stays). Losing copies are marked in the global `losers` bitmap.
+fn dedup_events(parts: Vec<Vec<DE>>, off: &[u32], losers: &[AtomicU64]) {
     let t = Instant::now();
     let n: usize = parts.iter().map(|v| v.len()).sum();
-    let rec = |loc: u64| &recs[(loc >> 32) as usize][loc as u32 as usize];
-    let lose = |loc: u64| {
-        let i = loc as u32 as usize;
-        losers[(loc >> 32) as usize][i >> 6].fetch_or(1u64 << (i & 63), Relaxed);
+    let lose = |g: u32| {
+        losers[g as usize >> 6].fetch_or(1u64 << (g & 63), Relaxed);
     };
     // Split into sub-buckets by the hash's top bits (streaming writes), then
     // dedup each bucket with a table small enough to stay in L2 (about 4096
-    // entries, 64 KiB).
+    // entries, 96 KiB).
     let sub_bits = (n / 4096).max(1).next_power_of_two().trailing_zeros().min(12);
     let sub = 1usize << sub_bits;
     DEDUP_TABLE.with(|cell| {
@@ -1073,9 +1066,11 @@ fn dedup_events(parts: Vec<Vec<DE>>, recs: &[Vec<Ev>], losers: &[Vec<AtomicU64>]
             b.clear();
             b.reserve(n / sub + n / (sub * 4) + 16);
         }
-        for v in &parts {
+        for (ci, v) in parts.iter().enumerate() {
+            let base = off[ci];
             for &x in v {
-                buckets[if sub_bits == 0 { 0 } else { (x.k0 >> (64 - sub_bits)) as usize }].push(x);
+                let h = x.k.h();
+                buckets[if sub_bits == 0 { 0 } else { (h >> (64 - sub_bits)) as usize }].push(DE { row: base + x.row, ..x });
             }
         }
         for b in buckets.iter() {
@@ -1084,25 +1079,22 @@ fn dedup_events(parts: Vec<Vec<DE>>, recs: &[Vec<Ev>], losers: &[Vec<AtomicU64>]
             table.clear();
             table.resize(cap, DE_EMPTY);
             for &x in b {
-                let mut i = x.k0 as usize & mask;
+                let mut i = x.k.h() as usize & mask;
                 loop {
                     let d = table[i];
-                    if d.loc == u64::MAX {
+                    if d.row == u32::MAX {
                         table[i] = x;
                         break;
                     }
-                    if d.k0 == x.k0 {
-                        let (w, e) = (rec(d.loc), rec(x.loc));
-                        if w.eid == e.eid {
-                            // Smallest ingest_ts wins; equal ones are identical copies.
-                            if e.ingest < w.ingest {
-                                lose(d.loc);
-                                table[i].loc = x.loc;
-                            } else {
-                                lose(x.loc);
-                            }
-                            break;
+                    if d.k == x.k {
+                        // Smallest ingest_ts wins; equal ones are identical copies.
+                        if x.ingest < d.ingest {
+                            lose(d.row);
+                            table[i] = x;
+                        } else {
+                            lose(x.row);
                         }
+                        break;
                     }
                     i = (i + 1) & mask;
                 }
@@ -1116,12 +1108,12 @@ fn dedup_events(parts: Vec<Vec<DE>>, recs: &[Vec<Ev>], losers: &[Vec<AtomicU64>]
 /// chunks to their person partitions, in file order; link lookups are
 /// prefetched in batches. Grouping chunks keeps the number of output pieces
 /// per person partition small (about 64, not one per chunk).
-fn route_events(recs: &[Vec<Ev>], lost: &[Vec<AtomicU64>], links: &Links) -> Vec<Vec<UEv>> {
+fn route_events(recs: &[Vec<Ev>], off: &[u32], lost: &[AtomicU64], links: &Links) -> Vec<Vec<UEv>> {
     let t = Instant::now();
     let total: usize = recs.iter().map(|r| r.len()).sum();
     let mut out: Vec<Vec<UEv>> = new_parts(total / NPART + total / (NPART * 8) + 16);
     const B: usize = 32;
-    let dummy = Ev { eid: K(0, 0), user: K(0, 0), user_s: PS::new(&[]), ingest: 0, ts: 0, price: 0, cat: 0, kind: 0 };
+    let dummy = Ev { user: K(0, 0), user_s: PS::new(&[]), ts: 0, price: 0, cat: 0, kind: 0 };
     let mut batch: [&Ev; B] = [&dummy; B];
     let mut nb = 0;
     let emit = |batch: &[&Ev], out: &mut Vec<Vec<UEv>>| {
@@ -1134,13 +1126,16 @@ fn route_events(recs: &[Vec<Ev>], lost: &[Vec<AtomicU64>], links: &Links) -> Vec
             out[part].push(UEv { who: e.user, pid, who_s: e.user_s, ts: e.ts, price: e.price, cat: e.cat, kind: e.kind });
         }
     };
-    for (recs, lost) in recs.iter().zip(lost) {
-        for (w, block) in recs.chunks(64).enumerate() {
-            let lw = lost[w].load(Relaxed);
-            for (j, e) in block.iter().enumerate() {
-                if e.kind == 0 || (lw >> j) & 1 == 1 {
-                    continue;
-                }
+    for (recs, &base) in recs.iter().zip(off) {
+        for (j, e) in recs.iter().enumerate() {
+            if e.kind == 0 {
+                continue;
+            }
+            let g = base as usize + j;
+            if (lost[g >> 6].load(Relaxed) >> (g & 63)) & 1 == 1 {
+                continue;
+            }
+            {
                 batch[nb] = e;
                 nb += 1;
                 if nb == B {
@@ -1711,13 +1706,22 @@ fn main() {
         std::process::exit(0);
     }
     let (recs, keys): (Vec<Vec<Ev>>, Vec<Vec<Vec<DE>>>) = ev_parsed.into_iter().map(|p| (p.recs, p.keys)).unzip();
-    let losers: Vec<Vec<AtomicU64>> = recs.iter().map(|r| (0..r.len().div_ceil(64)).map(|_| AtomicU64::new(0)).collect()).collect();
+    // Global row offsets of the chunks (rows fit u32: an event row is at
+    // least 8 bytes, so that is over 32 GB of events).
+    let mut off: Vec<u32> = Vec::with_capacity(recs.len());
+    let mut total = 0u64;
+    for r in &recs {
+        off.push(total as u32);
+        total += r.len() as u64;
+    }
+    assert!(total < u32::MAX as u64, "too many event rows");
+    let losers: Vec<AtomicU64> = (0..(total as usize).div_ceil(64)).map(|_| AtomicU64::new(0)).collect();
     let (ev_by_person, ck_by_person) = rayon::join(
         || {
-            transpose(keys).into_par_iter().for_each(|p| dedup_events(p, &recs, &losers));
+            transpose(keys).into_par_iter().for_each(|p| dedup_events(p, &off, &losers));
             // About 64 routing tasks: enough to balance the threads.
             let g = recs.len().div_ceil(64).max(1);
-            recs.par_chunks(g).zip(losers.par_chunks(g)).map(|(r, l)| route_events(r, l, &links)).collect::<Vec<_>>()
+            recs.par_chunks(g).zip(off.par_chunks(g)).map(|(r, o)| route_events(r, o, &losers, &links)).collect::<Vec<_>>()
         },
         || ck_chunks.par_iter().map(|c| parse_clicks(c, &ctx, &links)).collect::<Vec<_>>(),
     );
@@ -1873,6 +1877,7 @@ mod tests {
 // Record sizes are part of the performance design; keep them from growing.
 const _: () = assert!(std::mem::size_of::<UCk>() == 40);
 const _: () = assert!(std::mem::size_of::<C2>() == 24);
-const _: () = assert!(std::mem::size_of::<Ev>() == 56);
+const _: () = assert!(std::mem::size_of::<Ev>() == 40);
+const _: () = assert!(std::mem::size_of::<DE>() == 24);
 const _: () = assert!(std::mem::size_of::<UEv>() == 40);
 const _: () = assert!(std::mem::size_of::<E2>() == 12);
