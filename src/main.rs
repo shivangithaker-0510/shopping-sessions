@@ -719,7 +719,7 @@ struct UEv {
 struct UCk {
     who: K,
     ts: i64,
-    cid: S,
+    cid: PS,
     camp: u32,
     pid: u32,
 }
@@ -968,7 +968,7 @@ fn parse_clicks(c: &Chunk, ctx: &Ctx, links: &Links) -> Vec<Vec<UCk>> {
     let mut out: Vec<Vec<UCk>> = new_parts(c.data.len() / 50 / NPART + 4);
     let m = c.map;
     let lo = ctx.ws - WEEK;
-    let mut tc = TsCache::default();
+    let mut tc = TsCache::new();
     // Valid clicks wait in a small batch so their link lookups can be prefetched.
     const B: usize = 32;
     let mut buf: Vec<UCk> = Vec::with_capacity(B);
@@ -979,27 +979,38 @@ fn parse_clicks(c: &Chunk, ctx: &Ctx, links: &Links) -> Vec<Vec<UCk>> {
             out[part].push(c);
         }
     };
-    scan_rows::<4>(c.data, |f| {
-        let cid = f[m[0] as usize];
-        let user = f[m[1] as usize];
-        if cid.is_empty() || user.is_empty() {
-            return;
-        }
-        let ts = match tc.parse(f[m[3] as usize]) {
-            Some(t) if t >= lo && t < ctx.we => t,
-            _ => return,
+    // Constant column positions for the documented header order.
+    macro_rules! rows {
+        ($col:expr) => {
+            scan_rows::<4>(c.data, |f| {
+                let col = $col;
+                let cid = f[col(0)];
+                let user = f[col(1)];
+                if cid.is_empty() || user.is_empty() {
+                    return;
+                }
+                let ts = match tc.parse(f[col(3)]) {
+                    Some(t) if t >= lo && t < ctx.we => t,
+                    _ => return,
+                };
+                let camp = match ctx.campaigns.get(f[col(2)]) {
+                    Some(&c) => c,
+                    None => return,
+                };
+                let k = key(user);
+                links.prefetch(k);
+                buf.push(UCk { who: k, ts, cid: PS::new(cid), camp, pid: NO_PID });
+                if buf.len() == B {
+                    flush(&mut buf, &mut out);
+                }
+            })
         };
-        let camp = match ctx.campaigns.get(f[m[2] as usize]) {
-            Some(&c) => c,
-            None => return,
-        };
-        let k = key(user);
-        links.prefetch(k);
-        buf.push(UCk { who: k, ts, cid, camp, pid: NO_PID });
-        if buf.len() == B {
-            flush(&mut buf, &mut out);
-        }
-    });
+    }
+    if m[..4] == [0, 1, 2, 3] {
+        rows!(|i: usize| i);
+    } else {
+        rows!(|i: usize| m[i] as usize);
+    }
     flush(&mut buf, &mut out);
     prof(3, t);
     out
@@ -1019,7 +1030,7 @@ struct E2 {
 #[derive(Clone, Copy)]
 struct C2 {
     ts: i64,
-    cid: S,
+    cid: PS,
     camp: u32,
 }
 
@@ -1278,7 +1289,7 @@ fn process_partition(part: usize, evs: Vec<Vec<UEv>>, cks: Vec<Vec<UCk>>, ctx: &
         coff[p + 1] = coff[p] + ccnt[p];
     }
     let mut cpos = coff.clone();
-    let mut carr: Vec<C2> = vec![C2 { ts: 0, cid: &[], camp: 0 }; coff[np] as usize];
+    let mut carr: Vec<C2> = vec![C2 { ts: 0, cid: PS::new(&[]), camp: 0 }; coff[np] as usize];
     let mut k = 0;
     for v in cks {
         for c in v {
@@ -1296,7 +1307,7 @@ fn process_partition(part: usize, evs: Vec<Vec<UEv>>, cks: Vec<Vec<UCk>>, ctx: &
     for p in 0..np {
         arr[off[p] as usize..off[p + 1] as usize].sort_unstable_by_key(|e| e.ts);
         carr[coff[p] as usize..coff[p + 1] as usize]
-            .sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.cid.cmp(b.cid)));
+            .sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.cid.get().cmp(b.cid.get())));
     }
     prof(6, t);
     let t = Instant::now();
@@ -1610,6 +1621,8 @@ mod tests {
 }
 
 // Record sizes are part of the performance design; keep them from growing.
+const _: () = assert!(std::mem::size_of::<UCk>() == 40);
+const _: () = assert!(std::mem::size_of::<C2>() == 24);
 const _: () = assert!(std::mem::size_of::<Ev>() == 56);
 const _: () = assert!(std::mem::size_of::<UEv>() == 40);
 const _: () = assert!(std::mem::size_of::<E2>() == 12);
