@@ -149,68 +149,131 @@ fn civil_ms(s: &[u8]) -> Option<i64> {
     Some(((days * 24 + hour) * 60 + minute) * 60_000 + second * 1_000)
 }
 
-/// Remembers the last validated `YYYY-MM-DD` so repeated dates skip the
-/// calendar math. Results are identical to `parse_ts`.
-#[derive(Default)]
+/// Eight ASCII digits (little-endian load of `b[i..i+8]`) to their value, or
+/// None if any byte is not `0`..`9`.
+#[inline(always)]
+fn swar8(b: &[u8], i: usize) -> Option<u64> {
+    let v = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+    let d = v.wrapping_sub(0x3030_3030_3030_3030);
+    // Every byte must be 0..=9: no borrow out of the subtraction (high bit
+    // clear) and adding 6 must not carry into bit 4.
+    if (v & 0xF0F0_F0F0_F0F0_F0F0) != 0x3030_3030_3030_3030
+        || (d.wrapping_add(0x0606_0606_0606_0606) & 0xF0F0_F0F0_F0F0_F0F0) != 0
+    {
+        return None;
+    }
+    let d = (d.wrapping_mul(10) + (d >> 8)) & 0x00FF_00FF_00FF_00FF;
+    let d = (d.wrapping_mul(100) + (d >> 16)) & 0x0000_FFFF_0000_FFFF;
+    Some((d.wrapping_mul(10_000) + (d >> 32)) & 0xFFFF_FFFF)
+}
+
+/// Validated `YYYY-MM-DD` to days since the epoch (None if not a real date).
+#[inline(never)]
+fn civil_days(s: &[u8]) -> Option<i64> {
+    if s[4] != b'-' || s[7] != b'-' {
+        return None;
+    }
+    let year = d2(s, 0)? * 100 + d2(s, 2)?;
+    let month = d2(s, 5)?;
+    let day = d2(s, 8)?;
+    if !(1..=12).contains(&month) || day < 1 {
+        return None;
+    }
+    let dim = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            if is_leap(year) {
+                29
+            } else {
+                28
+            }
+        }
+    };
+    if day > dim {
+        return None;
+    }
+    Some(days_from_civil(year, month, day))
+}
+
+const TC_SLOTS: usize = 64;
+
+/// Direct-mapped cache of validated dates (the 10 bytes `YYYY-MM-DD` packed
+/// into a u128 key), so the calendar math runs once per distinct date and
+/// slot. Only valid dates are cached; results are identical to `parse_ts`.
 pub struct TsCache {
-    date: [u8; 10],
-    days: i64,
+    keys: [u128; TC_SLOTS],
+    days: [i64; TC_SLOTS],
+}
+
+impl Default for TsCache {
+    fn default() -> Self {
+        TsCache { keys: [u128::MAX; TC_SLOTS], days: [0; TC_SLOTS] }
+    }
 }
 
 impl TsCache {
-    #[inline]
+    #[inline(always)]
     fn civil_ms(&mut self, s: &[u8]) -> Option<i64> {
-        if s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+        // s.len() >= 20 here.
+        if s[10] != b'T' {
             return None;
         }
-        let days = if s[..10] == self.date {
-            self.days
+        let lo = u64::from_le_bytes(s[0..8].try_into().unwrap());
+        let hi = u16::from_le_bytes([s[8], s[9]]);
+        let key = (lo as u128) | ((hi as u128) << 64);
+        let slot = ((lo >> 40) as usize ^ (hi as usize) * 7) & (TC_SLOTS - 1);
+        let days = if self.keys[slot] == key {
+            self.days[slot]
         } else {
-            if s[4] != b'-' || s[7] != b'-' {
-                return None;
-            }
-            let year = d2(s, 0)? * 100 + d2(s, 2)?;
-            let month = d2(s, 5)?;
-            let day = d2(s, 8)?;
-            if !(1..=12).contains(&month) || day < 1 {
-                return None;
-            }
-            let dim = match month {
-                1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-                4 | 6 | 9 | 11 => 30,
-                _ => {
-                    if is_leap(year) {
-                        29
-                    } else {
-                        28
-                    }
-                }
-            };
-            if day > dim {
-                return None;
-            }
-            let d = days_from_civil(year, month, day);
-            self.date.copy_from_slice(&s[..10]);
-            self.days = d;
+            let d = civil_days(s)?;
+            self.keys[slot] = key;
+            self.days[slot] = d;
             d
         };
-        let hour = d2(s, 11)?;
-        let minute = d2(s, 14)?;
-        let second = d2(s, 17)?;
+        // "HH:MM:SS" as one u64: check the colons, then the six digits.
+        let t = u64::from_le_bytes(s[11..19].try_into().unwrap());
+        if (t >> 16) as u8 != b':' || (t >> 40) as u8 != b':' {
+            return None;
+        }
+        let dg = t.wrapping_sub(0x3030_0030_3000_3030) & !0x0000_FF00_00FF_0000;
+        // Each digit byte must be 0..=9.
+        if (t & 0xF0F0_00F0_F000_F0F0) != 0x3030_0030_3000_3030
+            || (dg.wrapping_add(0x0606_0006_0600_0606) & 0xF0F0_00F0_F000_F0F0) != 0
+        {
+            return None;
+        }
+        let b = |k: u32| ((dg >> (8 * k)) & 0xFF) as i64;
+        let hour = b(0) * 10 + b(1);
+        let minute = b(3) * 10 + b(4);
+        let second = b(6) * 10 + b(7);
         if hour > 23 || minute > 59 || second > 59 {
             return None;
         }
-        Some(((days * 24 + hour) * 60 + minute) * 60_000 + second * 1_000)
+        Some(days * DAY + hour * 3_600_000 + minute * 60_000 + second * 1_000)
     }
 
     /// Same contract as `parse_ts`.
-    #[inline]
+    #[inline(always)]
     pub fn parse(&mut self, s: &[u8]) -> Option<i64> {
         let n = s.len();
         if n == 0 {
             return None;
         }
         if s[0].is_ascii_digit() && (n < 5 || s[4] != b'-') {
+            if n == 13 {
+                // The common F3 shape: 5 + 8 digits.
+                let a = swar8(s, 5)?;
+                let mut h: u64 = 0;
+                for &c in &s[..5] {
+                    let d = c.wrapping_sub(b'0');
+                    if d > 9 {
+                        return None;
+                    }
+                    h = h * 10 + d as u64;
+                }
+                return Some((h * 100_000_000 + a) as i64);
+            }
             return parse_ts(s);
         }
         if n == 20 {
@@ -350,6 +413,23 @@ mod tests {
             for s in cases {
                 assert_eq!(c.parse(s), parse_ts(s), "{}", String::from_utf8_lossy(s));
             }
+        }
+        // Exhaustive-ish agreement on random mutations of valid stamps.
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let alphabet = b"0123456789-:TZ+z /.9";
+        for base in [&b"2027-12-19T02:19:44Z"[..], b"2028-02-29T23:59:59+05:30", b"1829017465000", b"2027-02-28T00:00:00-00:00"] {
+            for _ in 0..200_000 {
+                let mut v = base.to_vec();
+                for _ in 0..(seed % 3 + 1) {
+                    seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+                    let i = (seed as usize >> 8) % v.len();
+                    v[i] = alphabet[(seed as usize >> 32) % alphabet.len()];
+                }
+                assert_eq!(c.parse(&v), parse_ts(&v), "{}", String::from_utf8_lossy(&v));
+            }
+        }
+        for s in [&b"1829017465000"[..], b"0000000000000", b"9999999999999", b"18290174650:0", b"1829017465/00"] {
+            assert_eq!(c.parse(s), parse_ts(s), "{}", String::from_utf8_lossy(s));
         }
         // A cached date must not bypass separator checks on a different string.
         c.parse(b"2026-10-03T23:58:10Z");

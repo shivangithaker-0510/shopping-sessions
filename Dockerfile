@@ -1,6 +1,7 @@
 # Shopping Sessions: native Rust pipeline.
 # Build stage compiles a release binary; the runtime image only holds that binary.
 FROM rust:1.88-slim-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends make && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 # Pre-fetch and pre-build dependencies so source edits rebuild fast.

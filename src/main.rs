@@ -6,6 +6,18 @@
 //! by hash partition (event id -> user id -> person), so every lookup table a
 //! worker touches is partition-local and cache-sized.
 
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// jemalloc options: back the heap with transparent huge pages (the host's THP
+/// mode is usually `madvise`, so plain malloc gets 4 KiB pages and pays one
+/// page fault per 4 KiB touched), and never give memory back mid-run.
+#[cfg(target_os = "linux")]
+#[export_name = "malloc_conf"]
+pub static MALLOC_CONF: Option<&'static u8> =
+    Some(&b"thp:never,dirty_decay_ms:-1,muzzy_decay_ms:-1,background_thread:false\0"[0]);
+
 mod output;
 mod parse;
 
@@ -44,6 +56,36 @@ impl K {
     #[inline]
     fn part(self) -> usize {
         (self.1 as usize) & (NPART - 1)
+    }
+}
+
+/// A `&'static [u8]` packed into 8 bytes: address (low 48 bits) and length
+/// (high 16 bits). Longer strings go through a leaked indirection.
+#[derive(Clone, Copy)]
+pub struct PS(u64);
+
+impl PS {
+    const BIG: u64 = 0xFFFF;
+    #[inline(always)]
+    fn new(s: S) -> PS {
+        let p = s.as_ptr() as u64;
+        let n = s.len() as u64;
+        if n < Self::BIG && p >> 48 == 0 {
+            PS(p | (n << 48))
+        } else {
+            let b: &'static S = Box::leak(Box::new(s));
+            PS((b as *const S as u64) | (Self::BIG << 48))
+        }
+    }
+    #[inline(always)]
+    fn get(self) -> S {
+        let n = self.0 >> 48;
+        let p = self.0 & ((1u64 << 48) - 1);
+        if n == Self::BIG {
+            unsafe { *(p as *const S) }
+        } else {
+            unsafe { std::slice::from_raw_parts(p as *const u8, n as usize) }
+        }
     }
 }
 
@@ -538,7 +580,7 @@ const K_PURCHASE: u8 = 3;
 struct Ev {
     eid: K,
     user: K,
-    user_s: S,
+    user_s: PS,
     ingest: i64,
     ts: i64,
     price: u32,
@@ -550,7 +592,7 @@ struct Ev {
 #[derive(Clone, Copy)]
 struct UEv {
     who: K,
-    who_s: S,
+    who_s: PS,
     ts: i64,
     price: u32,
     cat: u16,
@@ -620,7 +662,7 @@ fn parse_events(c: &Chunk, ctx: &Ctx) -> Vec<Vec<Ev>> {
         }
         let user = if kind != 0 { key(user_s) } else { K::default() };
         let ek = key(eid);
-        out[ek.part()].push(Ev { eid: ek, user, user_s, ingest: ingest.unwrap_or(i64::MAX), ts, price, cat, kind });
+        out[ek.part()].push(Ev { eid: ek, user, user_s: PS::new(user_s), ingest: ingest.unwrap_or(i64::MAX), ts, price, cat, kind });
     });
     prof(1, t);
     out
@@ -680,7 +722,12 @@ fn dedup_events(parts: Vec<Vec<Ev>>, links: &Links) -> Vec<Vec<UEv>> {
             if e.kind == 0 {
                 continue;
             }
-            let (nk, ns) = if g[j] == u32::MAX { (e.user, e.user_s) } else { links.names[g[j] as usize] };
+            let (nk, ns) = if g[j] == u32::MAX {
+                (e.user, e.user_s)
+            } else {
+                let (k, s) = links.names[g[j] as usize];
+                (k, PS::new(s))
+            };
             out[nk.part()].push(UEv { who: nk, who_s: ns, ts: e.ts, price: e.price, cat: e.cat, kind: e.kind });
         }
     }
@@ -938,7 +985,7 @@ fn process_partition(evs: Vec<Vec<UEv>>, cks: Vec<Vec<UCk>>, ctx: &Ctx, rank: &[
                     Entry::Vacant(vac) => {
                         let id = names.len() as u32;
                         vac.insert(id);
-                        names.push((e.who, e.who_s));
+                        names.push((e.who, e.who_s.get()));
                         cnt.push(0);
                         id
                     }
