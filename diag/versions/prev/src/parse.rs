@@ -196,95 +196,140 @@ fn civil_days(s: &[u8]) -> Option<i64> {
     Some(days_from_civil(year, month, day))
 }
 
-const TC_SLOTS: usize = 64;
+/// Valid calendar dates of a span of years as a direct table: entry
+/// `((year - base) * 12 + month - 1) * 32 + day` holds days since the epoch,
+/// or `NO_DATE` for an impossible date (day 0, February 30, ...). Dates in
+/// years outside the table fall back to `civil_days`.
+struct DateTable {
+    base: i64,
+    years: i64,
+    days: Vec<i32>,
+}
 
-/// Direct-mapped cache of validated dates (the 10 bytes `YYYY-MM-DD` packed
-/// into a u128 key), so the calendar math runs once per distinct date and
-/// slot. Only valid dates are cached; results are identical to `parse_ts`.
+const NO_DATE: i32 = i32::MIN;
+
+impl DateTable {
+    fn new(base: i64, years: i64) -> DateTable {
+        let mut days = vec![NO_DATE; (years * 12 * 32) as usize];
+        for y in base..base + years {
+            for m in 1..=12i64 {
+                for d in 0..32i64 {
+                    let txt = format!("{y:04}-{m:02}-{d:02}");
+                    if let Some(v) = civil_days(txt.as_bytes()) {
+                        days[(((y - base) * 12 + m - 1) * 32 + d) as usize] = v as i32;
+                    }
+                }
+            }
+        }
+        DateTable { base, years, days }
+    }
+}
+
+static DATES: std::sync::OnceLock<DateTable> = std::sync::OnceLock::new();
+
+/// Centres the date table on the window (call once, before parsing; without
+/// it the table covers 2024-2031). Any date outside it is still exact.
+pub fn init_dates(window_start_ms: i64) {
+    let year = 1970 + window_start_ms.div_euclid(DAY) * 400 / 146_097;
+    let _ = DATES.set(DateTable::new((year - 2).max(0), 6));
+}
+
+#[inline(always)]
+fn dates() -> &'static DateTable {
+    DATES.get_or_init(|| DateTable::new(2024, 8))
+}
+
+/// Byte k of `v` is an ASCII digit for every byte k selected by `m` (0xFF).
+#[inline(always)]
+fn digits_at(v: u64, m: u64) -> bool {
+    let hi_m = m & 0xF0F0_F0F0_F0F0_F0F0;
+    let d = v.wrapping_sub(0x3030_3030_3030_3030 & m) & m;
+    (v & hi_m) == (0x3030_3030_3030_3030 & hi_m) && (d.wrapping_add(0x0606_0606_0606_0606 & m) & hi_m) == 0
+}
+
+/// Timestamp parser for the hot loops. Results are identical to `parse_ts`.
 pub struct TsCache {
-    keys: [u128; TC_SLOTS],
-    days: [i64; TC_SLOTS],
+    t: &'static DateTable,
 }
 
 impl Default for TsCache {
     fn default() -> Self {
-        TsCache { keys: [u128::MAX; TC_SLOTS], days: [0; TC_SLOTS] }
+        TsCache::new()
     }
 }
 
 impl TsCache {
+    /// Resolves the date table once, so the hot loop does not.
+    pub fn new() -> TsCache {
+        TsCache { t: dates() }
+    }
+
+    /// `YYYY-MM-DDTHH:MM:SS` (first 19 bytes of s, s.len() >= 20) to epoch ms.
     #[inline(always)]
     fn civil_ms(&mut self, s: &[u8]) -> Option<i64> {
-        // s.len() >= 20 here.
-        if s[10] != b'T' {
-            return None;
-        }
         let lo = u64::from_le_bytes(s[0..8].try_into().unwrap());
-        let hi = u16::from_le_bytes([s[8], s[9]]);
-        let key = (lo as u128) | ((hi as u128) << 64);
-        // Month and day bytes, mixed so every distinct date in a window spreads.
-        let h = ((lo >> 40) ^ ((hi as u64) << 24)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let slot = (h >> 58) as usize & (TC_SLOTS - 1);
-        let days = if self.keys[slot] == key {
-            self.days[slot]
+        // "YYYY-MM-": digits at bytes 0-3 and 5-6, dashes at 4 and 7.
+        if (lo >> 32) as u8 != b'-' || (lo >> 56) as u8 != b'-' || s[10] != b'T' {
+            return None;
+        }
+        if !digits_at(lo, 0x00FF_FF00_FFFF_FFFF) {
+            return None;
+        }
+        let (d8, d9) = (s[8].wrapping_sub(b'0'), s[9].wrapping_sub(b'0'));
+        if d8 > 9 || d9 > 9 {
+            return None;
+        }
+        let b = |k: u32| ((lo >> (8 * k)) & 0x0F) as i64;
+        let year = b(0) * 1000 + b(1) * 100 + b(2) * 10 + b(3);
+        let month = b(5) * 10 + b(6);
+        let day = d8 as i64 * 10 + d9 as i64;
+        let t = self.t;
+        let days = if year >= t.base && year < t.base + t.years && (1..=12).contains(&month) && day < 32 {
+            let v = t.days[(((year - t.base) * 12 + month - 1) * 32 + day) as usize];
+            if v == NO_DATE {
+                return None;
+            }
+            v as i64
         } else {
-            let d = civil_days(s)?;
-            self.keys[slot] = key;
-            self.days[slot] = d;
-            d
+            civil_days(s)?
         };
-        // "HH:MM:SS" as one u64: check the colons, then the six digits.
-        let t = u64::from_le_bytes(s[11..19].try_into().unwrap());
-        if (t >> 16) as u8 != b':' || (t >> 40) as u8 != b':' {
+        // "HH:MM:SS" as one u64: colons at bytes 2 and 5, digits elsewhere.
+        let tm = u64::from_le_bytes(s[11..19].try_into().unwrap());
+        if (tm >> 16) as u8 != b':' || (tm >> 40) as u8 != b':' || !digits_at(tm, 0xFFFF_00FF_FF00_FFFF) {
             return None;
         }
-        let dg = t.wrapping_sub(0x3030_0030_3000_3030) & !0x0000_FF00_00FF_0000;
-        // Each digit byte must be 0..=9.
-        if (t & 0xF0F0_00F0_F000_F0F0) != 0x3030_0030_3000_3030
-            || (dg.wrapping_add(0x0606_0006_0600_0606) & 0xF0F0_00F0_F000_F0F0) != 0
-        {
-            return None;
-        }
-        let b = |k: u32| ((dg >> (8 * k)) & 0xFF) as i64;
-        let hour = b(0) * 10 + b(1);
-        let minute = b(3) * 10 + b(4);
-        let second = b(6) * 10 + b(7);
+        let c = |k: u32| ((tm >> (8 * k)) & 0x0F) as i64;
+        let hour = c(0) * 10 + c(1);
+        let minute = c(3) * 10 + c(4);
+        let second = c(6) * 10 + c(7);
         if hour > 23 || minute > 59 || second > 59 {
             return None;
         }
         Some(days * DAY + hour * 3_600_000 + minute * 60_000 + second * 1_000)
     }
 
-    /// Same contract as `parse_ts`.
+    /// Same contract as `parse_ts`; the common shapes are tested first.
     #[inline(always)]
     pub fn parse(&mut self, s: &[u8]) -> Option<i64> {
         let n = s.len();
-        if n == 0 {
-            return None;
-        }
-        if s[0].is_ascii_digit() && (n < 5 || s[4] != b'-') {
-            if n == 13 {
-                // The common F3 shape: 5 + 8 digits.
-                let a = swar8(s, 5)?;
-                let mut h: u64 = 0;
-                for &c in &s[..5] {
-                    let d = c.wrapping_sub(b'0');
-                    if d > 9 {
-                        return None;
-                    }
-                    h = h * 10 + d as u64;
-                }
-                return Some((h * 100_000_000 + a) as i64);
-            }
-            return parse_ts(s);
-        }
-        if n == 20 {
-            if s[19] != b'Z' {
-                return None;
-            }
+        if n == 20 && s[19] == b'Z' {
+            // F1 (or a 20-digit-ish string ending in Z, which is bad either way).
             return self.civil_ms(s);
         }
-        if n == 25 {
+        if n == 13 {
+            // The common F3 shape: 5 + 8 digits.
+            let a = swar8(s, 5)?;
+            let mut h: u64 = 0;
+            for &c in &s[..5] {
+                let d = c.wrapping_sub(b'0');
+                if d > 9 {
+                    return None;
+                }
+                h = h * 10 + d as u64;
+            }
+            return Some((h * 100_000_000 + a) as i64);
+        }
+        if n == 25 && s[4] == b'-' {
             let sign = match s[19] {
                 b'+' => 1,
                 b'-' => -1,
@@ -301,7 +346,7 @@ impl TsCache {
             let local = self.civil_ms(s)?;
             return Some(local - sign * (oh * 60 + om) * 60_000);
         }
-        None
+        parse_ts(s)
     }
 }
 
@@ -430,7 +475,13 @@ mod tests {
                 assert_eq!(c.parse(&v), parse_ts(&v), "{}", String::from_utf8_lossy(&v));
             }
         }
-        for s in [&b"1829017465000"[..], b"0000000000000", b"9999999999999", b"18290174650:0", b"1829017465/00"] {
+        for s in [
+            &b"1829017465000"[..], b"0000000000000", b"9999999999999", b"18290174650:0", b"1829017465\x2f00",
+            b"1999-12-31T23:59:59Z", b"9999-12-31T23:59:59Z", b"0000-01-01T00:00:00Z", b"2100-02-29T00:00:00Z",
+            b"2000-02-29T00:00:00Z", b"2023-02-29T00:00:00Z", b"2024-02-29T12:00:00+05:30", b"2024-00-10T00:00:00Z",
+            b"2024-01-00T00:00:00Z", b"2024-01-32T00:00:00Z", b"0000000000000000000Z", b"00000000000000000000",
+            b"2024-01-01T00:00:00-0000", b"2024-01-01T00:00:00+00:00", b"2024-01-01T00:00:00\x2b00:00",
+        ] {
             assert_eq!(c.parse(s), parse_ts(s), "{}", String::from_utf8_lossy(s));
         }
         // A cached date must not bypass separator checks on a different string.
