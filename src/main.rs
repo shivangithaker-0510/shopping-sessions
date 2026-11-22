@@ -119,7 +119,8 @@ fn mem_stats() -> String {
     let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
     let f: Vec<&str> = stat.rsplit(')').next().unwrap_or("").split_whitespace().collect();
     if f.len() > 10 {
-        format!("| {hwm} minflt={}", f[7])
+        let tick = |i: usize| f[i].parse::<f64>().unwrap_or(0.0) / 100.0;
+        format!("| {hwm} minflt={} usr={:.2} sys={:.2}", f[7], tick(11), tick(12))
     } else {
         String::new()
     }
@@ -375,25 +376,29 @@ fn new_parts<T>(cap: usize) -> Vec<Vec<T>> {
 
 // ---------------------------------------------------------------- links
 
-/// One slot of the link table: an ID key and its person's key (the key of
-/// the person's name), in one 32-byte aligned cache line. An empty slot has
-/// `p == K(0, 0)`.
-#[derive(Clone, Copy, Default)]
+/// No linked-person id: the user is in no link.
+const NO_PID: u32 = u32::MAX;
+
+/// One slot of the link table: an ID key and its person's dense id, in one
+/// 32-byte aligned line. An empty slot has `pid == NO_PID`.
+#[derive(Clone, Copy)]
 #[repr(C, align(32))]
 struct Slot {
     k: K,
-    p: K,
+    pid: u32,
 }
 
+const SLOT_EMPTY: Slot = Slot { k: K(0, 0), pid: NO_PID };
+
 /// Every linked ID -> its person, as a flat open-addressing table split into
-/// one region per partition (so regions build in parallel). One cache miss per
-/// lookup, and lookups can be prefetched in batches. Person names are looked
-/// up separately, once per person, in `names`.
+/// one region per partition (so regions build in parallel); one cache miss
+/// per lookup. Linked people are numbered densely within their partition
+/// (`pid = part << 24 | index`), so later stages index arrays instead of
+/// hashing, and `names[part][index]` is the person's name.
 struct Links {
     rbits: u32,
     slots: Vec<Slot>,
-    /// Linked person key -> name, for every linked person.
-    names: HashTable<(K, S)>,
+    names: Vec<Vec<S>>,
 }
 
 impl Links {
@@ -409,27 +414,19 @@ impl Links {
             _mm_prefetch(self.slots.as_ptr().add(self.slot(k)) as *const i8, _MM_HINT_T0);
         }
     }
-    /// The person key of a linked ID, or None if the ID is in no link.
+    /// The dense person id of a linked ID, or NO_PID if the ID is in no link.
     #[inline(always)]
-    fn find(&self, k: K) -> Option<K> {
+    fn find(&self, k: K) -> u32 {
         let base = k.part() << self.rbits;
         let m = (1usize << self.rbits) - 1;
         let mut i = k.0 as usize & m;
         loop {
             let sl = &self.slots[base | i];
-            if sl.p == K(0, 0) {
-                return None;
-            }
-            if sl.k == k {
-                return Some(sl.p);
+            if sl.pid == NO_PID || sl.k == k {
+                return sl.pid;
             }
             i = (i + 1) & m;
         }
-    }
-    /// Name of a linked person (by person key).
-    #[inline]
-    fn name(&self, p: K) -> S {
-        self.names.find(p.h(), |x| x.0 == p).expect("linked person without a name").1
     }
 }
 
@@ -552,29 +549,33 @@ fn build_links(files: &[S]) -> Links {
             best[r as usize] = i;
         }
     }
+    // Number linked people densely within the partition of their name.
+    let mut names: Vec<Vec<S>> = vec![Vec::new(); NPART];
+    let mut pid_of_root = vec![NO_PID; nids];
+    for i in 0..nids {
+        if root[i] == i as u32 {
+            let nm = all[best[i] as usize];
+            let part = nm.0.part();
+            let idx = names[part].len();
+            assert!(idx < 1 << 24, "too many linked people in one partition");
+            pid_of_root[i] = (part as u32) << 24 | idx as u32;
+            names[part].push(nm.1);
+        }
+    }
     // Flat lookup table: one region per partition, each at most half full.
     let maxr = interned.iter().map(|x| x.1.len()).max().unwrap_or(0);
     let rbits = ((maxr * 2).max(2)).next_power_of_two().trailing_zeros();
     let rsize = 1usize << rbits;
-    let mut slots = vec![Slot::default(); rsize * NPART];
+    let mut slots = vec![SLOT_EMPTY; rsize * NPART];
     slots.par_chunks_mut(rsize).zip(interned.par_iter()).enumerate().for_each(|(b, (reg, x))| {
         for (i, &k) in x.1.iter().enumerate() {
             let mut j = k.0 as usize & (rsize - 1);
-            while reg[j].p != K(0, 0) {
+            while reg[j].pid != NO_PID {
                 j = (j + 1) & (rsize - 1);
             }
-            let p = all[best[root[offs[b] as usize + i] as usize] as usize].0;
-            assert!(p != K(0, 0), "zero person key");
-            reg[j] = Slot { k, p };
+            reg[j] = Slot { k, pid: pid_of_root[root[offs[b] as usize + i] as usize] };
         }
     });
-    let mut names: HashTable<(K, S)> = HashTable::with_capacity(nids / 2 + 16);
-    for i in 0..nids {
-        if root[i] == i as u32 {
-            let nm = all[best[i] as usize];
-            names.insert_unique(nm.0.h(), nm, |x| x.0.h());
-        }
-    }
     Links { rbits, slots, names }
 }
 
@@ -588,8 +589,10 @@ struct Ev {
     eid: K,
     user: K,
     user_s: PS,
-    ingest: i64,
-    ts: i64,
+    /// ingest_ts in whole seconds, relative to `Ctx::ingest_base` (see `pack_ingest`).
+    ingest: u32,
+    /// ts in ms relative to window_start (valid copies only).
+    ts: u32,
     price: u32,
     cat: u16,
     kind: u8,
@@ -598,14 +601,17 @@ struct Ev {
 /// A surviving event keyed by its user (then, after linking, by its person).
 #[derive(Clone, Copy)]
 struct UEv {
+    /// The user key (meaningful only when `pid == NO_PID`).
     who: K,
-    /// The event's own user string (the person's name unless `linked`).
+    /// Dense linked-person id (`part << 24 | index`), or NO_PID if the user is
+    /// in no link and is a person on its own.
+    pid: u32,
+    /// The event's own user string (the person's name when unlinked).
     who_s: PS,
-    ts: i64,
+    ts: u32,
     price: u32,
     cat: u16,
     kind: u8,
-    linked: bool,
 }
 
 /// A valid click keyed by its user (then by its person).
@@ -615,10 +621,13 @@ struct UCk {
     ts: i64,
     cid: S,
     camp: u32,
+    pid: u32,
 }
 
 struct Ctx {
     ws: i64,
+    /// Seconds origin of packed ingest_ts values.
+    ingest_base: i64,
     we: i64,
     products: HashMap<S, u16>,
     campaigns: HashMap<S, u32>,
@@ -626,6 +635,14 @@ struct Ctx {
     ncamp: u32,
     day0: i64,
     ndays: usize,
+}
+
+/// ingest_ts (ms; always whole seconds) as seconds from `base`, saturated to
+/// u32 (u32::MAX is reserved for a missing ingest_ts). Exact for any ingest_ts
+/// within 68 years of the window; only dedup compares it.
+#[inline(always)]
+fn pack_ingest(ms: i64, base: i64) -> u32 {
+    (ms.div_euclid(1000) - base).clamp(0, u32::MAX as i64 - 1) as u32
 }
 
 fn parse_events(c: &Chunk, ctx: &Ctx) -> Vec<Vec<Ev>> {
@@ -655,7 +672,7 @@ fn parse_events(c: &Chunk, ctx: &Ctx) -> Vec<Vec<Ev>> {
         };
         let user_s = f[m[1] as usize];
         let product = f[m[5] as usize];
-        let mut ts = 0;
+        let mut ts = 0u32;
         let mut price = 0;
         let mut cat = 0;
         if kind != 0 && (ingest.is_none() || user_s.is_empty() || product.is_empty()) {
@@ -664,7 +681,7 @@ fn parse_events(c: &Chunk, ctx: &Ctx) -> Vec<Vec<Ev>> {
         if kind != 0 {
             match tc.parse(f[m[2] as usize]) {
                 // Late: ingest_ts - ts over 24 h. (ts is in the window, no overflow.)
-                Some(t) if t >= ctx.ws && t < ctx.we && ingest.unwrap() - t <= DAY => ts = t,
+                Some(t) if t >= ctx.ws && t < ctx.we && ingest.unwrap() - t <= DAY => ts = (t - ctx.ws) as u32,
                 _ => kind = 0,
             }
         }
@@ -683,7 +700,11 @@ fn parse_events(c: &Chunk, ctx: &Ctx) -> Vec<Vec<Ev>> {
             std::hint::black_box((ek, user, ts, price, cat, kind, ingest));
             return;
         }
-        out[ek.part()].push(Ev { eid: ek, user, user_s: PS::new(user_s), ingest: ingest.unwrap_or(i64::MAX), ts, price, cat, kind });
+        let ingest = match ingest {
+            Some(x) => pack_ingest(x, ctx.ingest_base),
+            None => u32::MAX,
+        };
+        out[ek.part()].push(Ev { eid: ek, user, user_s: PS::new(user_s), ingest, ts, price, cat, kind });
     });
     prof(1, t);
     out
@@ -722,7 +743,7 @@ fn dedup_events(mut parts: Vec<Vec<Ev>>, links: &Links) -> Vec<Vec<UEv>> {
         let mut x = 0i64;
         for v in &parts {
             for e in v {
-                x = x.wrapping_add(e.ingest);
+                x = x.wrapping_add(e.ingest as i64);
             }
         }
         std::hint::black_box(x);
@@ -792,11 +813,9 @@ fn dedup_events(mut parts: Vec<Vec<Ev>>, links: &Links) -> Vec<Vec<UEv>> {
             links.prefetch(e.user);
         }
         for &e in batch {
-            let (who, linked) = match links.find(e.user) {
-                Some(p) => (p, true),
-                None => (e.user, false),
-            };
-            out[who.part()].push(UEv { who, who_s: e.user_s, ts: e.ts, price: e.price, cat: e.cat, kind: e.kind, linked });
+            let pid = links.find(e.user);
+            let part = if pid == NO_PID { e.user.part() } else { (pid >> 24) as usize };
+            out[part].push(UEv { who: e.user, pid, who_s: e.user_s, ts: e.ts, price: e.price, cat: e.cat, kind: e.kind });
         }
     };
     for v in &parts {
@@ -831,10 +850,9 @@ fn parse_clicks(c: &Chunk, ctx: &Ctx, links: &Links) -> Vec<Vec<UCk>> {
     let mut buf: Vec<UCk> = Vec::with_capacity(B);
     let flush = |buf: &mut Vec<UCk>, out: &mut Vec<Vec<UCk>>| {
         for mut c in buf.drain(..) {
-            if let Some(p) = links.find(c.who) {
-                c.who = p;
-            }
-            out[c.who.part()].push(c);
+            c.pid = links.find(c.who);
+            let part = if c.pid == NO_PID { c.who.part() } else { (c.pid >> 24) as usize };
+            out[part].push(c);
         }
     };
     scan_rows::<4>(c.data, |f| {
@@ -853,7 +871,7 @@ fn parse_clicks(c: &Chunk, ctx: &Ctx, links: &Links) -> Vec<Vec<UCk>> {
         };
         let k = key(user);
         links.prefetch(k);
-        buf.push(UCk { who: k, ts, cid, camp });
+        buf.push(UCk { who: k, ts, cid, camp, pid: NO_PID });
         if buf.len() == B {
             flush(&mut buf, &mut out);
         }
@@ -867,7 +885,8 @@ fn parse_clicks(c: &Chunk, ctx: &Ctx, links: &Links) -> Vec<Vec<UCk>> {
 
 #[derive(Clone, Copy, Default)]
 struct E2 {
-    ts: i64,
+    /// ms relative to window_start.
+    ts: u32,
     price: u32,
     cat: u16,
     kind: u8,
@@ -946,8 +965,9 @@ fn person(name: S, es: &[E2], cs: &[C2], ctx: &Ctx, rank: &[u32], acc: &mut Camp
     let mut cur_day: i64 = i64::MIN;
     let mut i = 0;
     let n = es.len();
+    let ws = ctx.ws;
     while i < n {
-        let start = es[i].ts;
+        let start = ws + es[i].ts as i64;
         let day = start.div_euclid(DAY);
         if day != cur_day {
             if cur_day != i64::MIN {
@@ -960,9 +980,9 @@ fn person(name: S, es: &[E2], cs: &[C2], ctx: &Ctx, rank: &[u32], acc: &mut Camp
         let mut rev = 0i64;
         let mut purch = false;
         // Gap over 30 min starts a new session; equal timestamps share one.
-        while i < n && es[i].ts - last <= GAP {
+        while i < n && ws + es[i].ts as i64 - last <= GAP {
             let e = es[i];
-            last = e.ts;
+            last = ws + e.ts as i64;
             nev += 1;
             if e.kind == K_PURCHASE {
                 purch = true;
@@ -1037,30 +1057,45 @@ fn person(name: S, es: &[E2], cs: &[C2], ctx: &Ctx, rank: &[u32], acc: &mut Camp
     }
 }
 
-fn process_partition(evs: Vec<Vec<UEv>>, cks: Vec<Vec<UCk>>, ctx: &Ctx, links: &Links, rank: &[u32], acc: &mut CampAcc) -> Vec<URow> {
+fn process_partition(part: usize, evs: Vec<Vec<UEv>>, cks: Vec<Vec<UCk>>, ctx: &Ctx, links: &Links, rank: &[u32], acc: &mut CampAcc) -> Vec<URow> {
     let t = Instant::now();
     let n: usize = evs.iter().map(|v| v.len()).sum();
     let mut rows = Vec::new();
     if n == 0 {
         return rows;
     }
-    // Group events by person (counting sort on a local person index).
-    let mut names: Vec<(K, S)> = Vec::new();
+    // Group events by person (counting sort on a local person index). Linked
+    // people are found through their dense id, the rest through a hash table.
+    let lnames = &links.names[part];
+    let mut lmap: Vec<u32> = vec![u32::MAX; lnames.len()];
+    let mut names: Vec<S> = Vec::new();
+    let mut ukeys: Vec<K> = Vec::new();
     let mut cnt: Vec<u32> = Vec::new();
-    let mut table: HashTable<u32> = HashTable::with_capacity(n / 4 + 16);
+    let mut table: HashTable<u32> = HashTable::with_capacity(n / 8 + 16);
     let mut pid: Vec<u32> = Vec::with_capacity(n);
     let mut last: (K, u32) = (K(u64::MAX, u64::MAX), u32::MAX);
     for v in &evs {
         for e in v {
-            let id = if last.1 != u32::MAX && last.0 == e.who {
+            let id = if e.pid != NO_PID {
+                let li = (e.pid & 0xFF_FFFF) as usize;
+                let m = &mut lmap[li];
+                if *m == u32::MAX {
+                    *m = names.len() as u32;
+                    names.push(lnames[li]);
+                    ukeys.push(K(0, 0));
+                    cnt.push(0);
+                }
+                *m
+            } else if last.1 != u32::MAX && last.0 == e.who {
                 last.1
             } else {
-                let id = match table.entry(e.who.h(), |&i| names[i as usize].0 == e.who, |&i| names[i as usize].0.h()) {
+                let id = match table.entry(e.who.h(), |&i| ukeys[i as usize] == e.who, |&i| ukeys[i as usize].h()) {
                     Entry::Occupied(o) => *o.get(),
                     Entry::Vacant(vac) => {
                         let id = names.len() as u32;
                         vac.insert(id);
-                        names.push((e.who, if e.linked { links.name(e.who) } else { e.who_s.get() }));
+                        names.push(e.who_s.get());
+                        ukeys.push(e.who);
                         cnt.push(0);
                         id
                     }
@@ -1095,8 +1130,13 @@ fn process_partition(evs: Vec<Vec<UEv>>, cks: Vec<Vec<UCk>>, ctx: &Ctx, links: &
     let mut cpid: Vec<u32> = Vec::new();
     for v in &cks {
         for c in v {
-            let id = match table.find(c.who.h(), |&i| names[i as usize].0 == c.who) {
-                Some(&i) => {
+            let found = if c.pid != NO_PID {
+                Some(lmap[(c.pid & 0xFF_FFFF) as usize]).filter(|&i| i != u32::MAX)
+            } else {
+                table.find(c.who.h(), |&i| ukeys[i as usize] == c.who).copied()
+            };
+            let id = match found {
+                Some(i) => {
                     ccnt[i as usize] += 1;
                     i
                 }
@@ -1136,7 +1176,7 @@ fn process_partition(evs: Vec<Vec<UEv>>, cks: Vec<Vec<UCk>>, ctx: &Ctx, links: &
     for p in 0..np {
         let es = &arr[off[p] as usize..off[p + 1] as usize];
         let cs = &carr[coff[p] as usize..coff[p + 1] as usize];
-        person(names[p].1, es, cs, ctx, rank, acc, &mut rows, &mut sc);
+        person(names[p], es, cs, ctx, rank, acc, &mut rows, &mut sc);
     }
     prof(7, t);
     rows
@@ -1206,7 +1246,7 @@ fn main() {
             let mut z = 0i64;
             for c in &chunks { scan_rows::<7>(c.data, |f| { z += parse_ts(f[2]).unwrap_or(0) + parse_ts(f[3]).unwrap_or(0); }); }
             let c2 = t.elapsed();
-            let ctx = Ctx { ws: 0, we: i64::MAX, products: HashMap::new(), campaigns: HashMap::new(), unknown_cat: 0, ncamp: 0, day0: 0, ndays: 1 };
+            let ctx = Ctx { ws: 0, ingest_base: 0, we: i64::MAX, products: HashMap::new(), campaigns: HashMap::new(), unknown_cat: 0, ncamp: 0, day0: 0, ndays: 1 };
             let t = Instant::now();
             let mut m = 0usize;
             for c in &chunks { m += parse_events(c, &ctx).iter().map(|v| v.len()).sum::<usize>(); }
@@ -1223,7 +1263,9 @@ fn main() {
     } else {
         (PathBuf::from(env("DATA_DIR", "/data")), PathBuf::from(env("OUTPUT_DIR", "/output")))
     };
-    let threads: usize = std::env::var("NCPU")
+    // SS_THREADS overrides the worker count (for oversubscription tests).
+    let threads: usize = std::env::var("SS_THREADS")
+        .or_else(|_| std::env::var("NCPU"))
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|&n| n > 0)
@@ -1275,7 +1317,9 @@ fn main() {
     }
     let day0 = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1).max(1) as usize;
-    let ctx = Ctx { ws, we, products, campaigns, unknown_cat, ncamp: camp_rows.len() as u32, day0, ndays };
+    assert!(we - ws < (1i64 << 32), "window longer than 49 days is not supported");
+    let ingest_base = ws.div_euclid(1000) - (1i64 << 31);
+    let ctx = Ctx { ws, ingest_base, we, products, campaigns, unknown_cat, ncamp: camp_rows.len() as u32, day0, ndays };
     log!(t0, "dims: {} products, {} categories, {} campaigns", ctx.products.len(), cat_names.len(), ctx.ncamp);
 
     let ev_chunks = make_chunks(
@@ -1309,10 +1353,11 @@ fn main() {
     let (users, camp) = transpose(re)
         .into_par_iter()
         .zip(transpose(rc).into_par_iter())
+        .enumerate()
         .fold(
             || (Vec::new(), CampAcc::new(&ctx)),
-            |(mut users, mut acc), (evs, cks)| {
-                users.push(process_partition(evs, cks, &ctx, &links, &rank, &mut acc));
+            |(mut users, mut acc), (part, (evs, cks))| {
+                users.push(process_partition(part, evs, cks, &ctx, &links, &rank, &mut acc));
                 (users, acc)
             },
         )
@@ -1379,3 +1424,8 @@ mod tests {
         assert_eq!(rows::<2>(b"\",y\n"), Vec::<Vec<&[u8]>>::new());
     }
 }
+
+// Record sizes are part of the performance design; keep them from growing.
+const _: () = assert!(std::mem::size_of::<Ev>() == 56);
+const _: () = assert!(std::mem::size_of::<UEv>() == 40);
+const _: () = assert!(std::mem::size_of::<E2>() == 12);
