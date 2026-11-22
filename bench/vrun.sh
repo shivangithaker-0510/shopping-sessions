@@ -15,6 +15,6 @@ docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 \
   --mount type=volume,src=ssout,dst=/output,volume-subpath=$DS \
   --mount type=volume,src=ssout,dst=/scratch,volume-subpath=scratch-$DS \
   -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
-  -e NCPU=${NCPU:-8} -e MEM_GB=24 "$IMAGE"
+  -e NCPU=${NCPU:-8} ${EXTRA_ENV:-} -e MEM_GB=24 "$IMAGE"
 end=$(python -c "import time;print(time.time())")
 python -c "print(\"WALL %.2f s\" % ($end - $start))" >&2
