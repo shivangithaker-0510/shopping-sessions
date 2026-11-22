@@ -1,0 +1,12 @@
+# Never commit data (repo must stay < 50 MB; data is mounted at run time)
+data/
+dev-data/
+output/
+scratch/
+*.csv
+*.parquet
+*.zip
+dev-answer/
+target/
+__pycache__/
+.venv/
