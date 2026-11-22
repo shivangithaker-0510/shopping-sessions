@@ -39,6 +39,9 @@ use xxhash_rust::xxh3::xxh3_128;
 
 /// Partition count (power of two) for hash-partitioned stages.
 const NPART: usize = 256;
+/// Person partitions per user_daily output file (32 files: enough tasks to
+/// balance 8 threads, few enough that each file is worth writing).
+const PART_GROUP: usize = 8;
 /// Default event-id partition count: few enough output streams per parse task
 /// to stay in L1, while dedup splits each partition further (see dedup_events).
 const EPART_DEFAULT: usize = 256;
@@ -339,8 +342,9 @@ impl Iterator for Structurals<'_> {
 }
 
 /// Which SIMD width builds the byte-class masks: 0 SSE2, 1 AVX2, 2 AVX-512BW.
-/// SSE2 unless `SS_ISA` asks for more (capped by what the CPU has): the
-/// masks are a small part of the scan, and wider ones measured no faster.
+/// AVX2 when the CPU has it (`SS_ISA` overrides, capped by the CPU). On the
+/// scorer (diag4) AVX2 was marginally the fastest and AVX-512 the slowest;
+/// all three gave byte-identical output.
 static ISA: AtomicU8 = AtomicU8::new(0);
 
 #[cfg(target_arch = "x86_64")]
@@ -352,7 +356,7 @@ fn pick_isa() -> u8 {
     } else {
         0
     };
-    let want = std::env::var("SS_ISA").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let want = std::env::var("SS_ISA").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
     want.min(best)
 }
 
@@ -1728,26 +1732,25 @@ fn main() {
     let (re, rc) = (ev_by_person, ck_by_person);
     log!(t0, "events deduped, clicks parsed");
 
-    let (users, camp) = transpose(re)
+    // Person partitions in groups; each group is sessionized and its
+    // user_daily file written right away, so writing overlaps the other
+    // groups' work instead of following all of it.
+    let ud = output::prepare(&out);
+    let mut groups: Vec<Vec<(usize, Vec<Vec<UEv>>, Vec<Vec<UCk>>)>> = (0..NPART.div_ceil(PART_GROUP)).map(|_| Vec::new()).collect();
+    for (part, (evs, cks)) in transpose(re).into_iter().zip(transpose(rc)).enumerate() {
+        groups[part / PART_GROUP].push((part, evs, cks));
+    }
+    let (nusers, camp) = groups
         .into_par_iter()
-        .zip(transpose(rc).into_par_iter())
         .enumerate()
-        .fold(
-            || (Vec::new(), CampAcc::new(&ctx)),
-            |(mut users, mut acc), (part, (evs, cks))| {
-                users.push(process_partition(part, evs, cks, &ctx, &links, &rank, &mut acc));
-                (users, acc)
-            },
-        )
-        .reduce(
-            || (Vec::new(), CampAcc::new(&ctx)),
-            |(mut u1, a1), (u2, a2)| {
-                u1.extend(u2);
-                (u1, a1.merge(a2))
-            },
-        );
-    let nusers: usize = users.iter().map(|v| v.len()).sum();
-    log!(t0, "sessionized: {nusers} user_daily rows");
+        .map(|(gi, g)| {
+            let mut acc = CampAcc::new(&ctx);
+            let users: Vec<Vec<URow>> = g.into_iter().map(|(part, evs, cks)| process_partition(part, evs, cks, &ctx, &links, &rank, &mut acc)).collect();
+            output::write_users(&ud, gi, &users, &cat_names);
+            (users.iter().map(|v| v.len()).sum::<usize>(), acc)
+        })
+        .reduce(|| (0, CampAcc::new(&ctx)), |(n1, a1), (n2, a2)| (n1 + n2, a1.merge(a2)));
+    log!(t0, "sessionized + user_daily written: {nusers} user_daily rows");
 
     let organic: S = b"organic";
     let mut crow = Vec::new();
@@ -1768,7 +1771,7 @@ fn main() {
             }
         }
     }
-    output::write_all(&out, users, crow, &cat_names, threads);
+    output::write_camps(&out, crow);
     log!(t0, "done");
     eprintln!("cpu seconds: {}", prof_report());
     std::process::exit(0);

@@ -8,7 +8,6 @@ use parquet::data_type::{ByteArray, ByteArrayType, Int32Type, Int64Type};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
-use rayon::prelude::*;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
@@ -122,21 +121,22 @@ fn camp_cols(rows: &[CRow]) -> Vec<Col> {
     ]
 }
 
-pub fn write_all(out: &Path, users: Vec<Vec<URow>>, camps: Vec<CRow>, cats: &[S], threads: usize) {
+/// Creates the two output folders; returns user_daily's.
+pub fn prepare(out: &Path) -> std::path::PathBuf {
     let ud = out.join("user_daily");
-    let cd = out.join("campaign_daily");
     std::fs::create_dir_all(&ud).expect("mkdir user_daily");
-    std::fs::create_dir_all(&cd).expect("mkdir campaign_daily");
-    let all: Vec<&URow> = users.iter().flat_map(|v| v.iter()).collect();
-    let nfiles = threads.max(1).min(all.len().max(1).div_ceil(50_000)).max(1);
-    let per = all.len().div_ceil(nfiles).max(1);
-    let pieces: Vec<&[&URow]> = if all.is_empty() { vec![&all[..]] } else { all.chunks(per).collect() };
-    rayon::join(
-        || {
-            pieces.par_iter().enumerate().for_each(|(i, rows)| {
-                write_file(&ud.join(format!("part-{i:05}.parquet")), USER_SCHEMA, user_cols(rows, cats));
-            })
-        },
-        || write_file(&cd.join("part-00000.parquet"), CAMP_SCHEMA, camp_cols(&camps)),
-    );
+    std::fs::create_dir_all(out.join("campaign_daily")).expect("mkdir campaign_daily");
+    ud
+}
+
+/// Writes one user_daily part file (rows from a group of partitions), as
+/// soon as that group is sessionized. Row order and file count do not
+/// matter (rules.md), so the groups write independently.
+pub fn write_users(ud: &Path, idx: usize, users: &[Vec<URow>], cats: &[S]) {
+    let rows: Vec<&URow> = users.iter().flat_map(|v| v.iter()).collect();
+    write_file(&ud.join(format!("part-{idx:05}.parquet")), USER_SCHEMA, user_cols(&rows, cats));
+}
+
+pub fn write_camps(out: &Path, camps: Vec<CRow>) {
+    write_file(&out.join("campaign_daily").join("part-00000.parquet"), CAMP_SCHEMA, camp_cols(&camps));
 }
