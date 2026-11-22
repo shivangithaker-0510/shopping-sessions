@@ -488,7 +488,27 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
     x
 }
 
-fn build_links(files: &[S]) -> Links {
+/// The parallel first half of the link build: every link line parsed, its
+/// two IDs interned (`all` holds each distinct linked ID), and `side` maps
+/// each pair side to its ID.
+struct LinksFront {
+    npairs: usize,
+    nids: usize,
+    offs: Vec<u32>,
+    side: Vec<u32>,
+    all: Vec<(K, S)>,
+    /// First 8 bytes of each ID, big-endian and zero-padded: comparing these
+    /// orders IDs byte-wise except on ties, which compare the full strings.
+    pre: Vec<u64>,
+    ids: Vec<Vec<K>>,
+}
+
+/// Parses and interns the link files. Run it on the whole pool before event
+/// parsing starts: it is small, and inside a join it would queue behind the
+/// event chunks.
+fn links_front(files: &[S]) -> LinksFront {
+    let lt = Instant::now();
+    macro_rules! lp { ($m:expr) => { if std::env::var("SS_LINKPROF").is_ok() { eprintln!("  links {:>7.3}s {}", lt.elapsed().as_secs_f64(), $m); } } }
     let chunks = make_chunks(files, &["user_id_a", "user_id_b"]);
     // Parse; each task emits its pairs' sides scattered by partition.
     let per_task: Vec<(usize, Vec<Vec<(K, u32, S)>>)> = chunks
@@ -511,6 +531,7 @@ fn build_links(files: &[S]) -> Links {
             (n as usize, out)
         })
         .collect();
+    lp!("parsed");
     let mut base = vec![0u32; per_task.len() + 1];
     for (i, (n, _)) in per_task.iter().enumerate() {
         base[i + 1] = base[i] + *n as u32;
@@ -532,6 +553,7 @@ fn build_links(files: &[S]) -> Links {
             v
         })
         .collect();
+    lp!("rebased");
     // Intern each partition.
     let interned: Vec<(HashTable<u32>, Vec<K>, Vec<S>, Vec<(u32, u32)>)> = transpose(tasks)
         .into_par_iter()
@@ -559,6 +581,7 @@ fn build_links(files: &[S]) -> Links {
             (table, ids, strs, assign)
         })
         .collect();
+    lp!("interned");
     let mut offs = vec![0u32; NPART + 1];
     for (b, x) in interned.iter().enumerate() {
         offs[b + 1] = offs[b] + x.1.len() as u32;
@@ -574,6 +597,26 @@ fn build_links(files: &[S]) -> Links {
     for x in &interned {
         all.extend(x.1.iter().copied().zip(x.2.iter().copied()));
     }
+    lp!("sides");
+    let pre: Vec<u64> = all
+        .par_iter()
+        .map(|&(_, s)| {
+            let mut b = [0u8; 8];
+            let n = s.len().min(8);
+            b[..n].copy_from_slice(&s[..n]);
+            u64::from_be_bytes(b)
+        })
+        .collect();
+    let ids = interned.into_iter().map(|x| x.1).collect();
+    LinksFront { npairs, nids, offs, side, all, pre, ids }
+}
+
+/// The second half: union-find, names, dense person ids and the lookup
+/// table. Runs alongside event parsing.
+fn links_tail(f: LinksFront) -> Links {
+    let lt = Instant::now();
+    macro_rules! lp { ($m:expr) => { if std::env::var("SS_LINKPROF").is_ok() { eprintln!("  links tail {:>7.3}s {}", lt.elapsed().as_secs_f64(), $m); } } }
+    let LinksFront { npairs, nids, offs, side, all, pre, ids } = f;
     // Union-find over every linked pair.
     let mut parent: Vec<u32> = (0..nids as u32).collect();
     for p in 0..npairs {
@@ -587,37 +630,45 @@ fn build_links(files: &[S]) -> Links {
             }
         }
     }
+    lp!("unionfind");
     drop(side);
-    // The byte-wise smallest ID of each component names it.
+    // The byte-wise smallest ID of each component names it (prefixes first,
+    // full strings only on a prefix tie).
     let mut root = vec![0u32; nids];
     let mut best: Vec<u32> = (0..nids as u32).collect();
     for i in 0..nids as u32 {
         let r = find(&mut parent, i);
         root[i as usize] = r;
-        if all[i as usize].1 < all[best[r as usize] as usize].1 {
+        let b = best[r as usize] as usize;
+        let (pi, pb) = (pre[i as usize], pre[b]);
+        if pi < pb || (pi == pb && all[i as usize].1 < all[b].1) {
             best[r as usize] = i;
         }
     }
+    drop(parent);
+    lp!("names-min");
     // Number linked people densely within the partition of their name.
     let mut names: Vec<Vec<S>> = vec![Vec::new(); NPART];
     let mut pid_of_root = vec![NO_PID; nids];
-    for i in 0..nids {
-        if root[i] == i as u32 {
-            let nm = all[best[i] as usize];
-            let part = nm.0.part();
-            let idx = names[part].len();
-            assert!(idx < 1 << 24, "too many linked people in one partition");
-            pid_of_root[i] = (part as u32) << 24 | idx as u32;
-            names[part].push(nm.1);
+    for r in 0..nids {
+        if root[r] != r as u32 {
+            continue;
         }
+        let nm = all[best[r] as usize];
+        let part = nm.0.part();
+        let idx = names[part].len();
+        assert!(idx < 1 << 24, "too many linked people in one partition");
+        pid_of_root[r as usize] = (part as u32) << 24 | idx as u32;
+        names[part].push(nm.1);
     }
+    lp!("numbered");
     // Flat lookup table: one region per partition, each at most half full.
-    let maxr = interned.iter().map(|x| x.1.len()).max().unwrap_or(0);
+    let maxr = ids.iter().map(|x| x.len()).max().unwrap_or(0);
     let rbits = ((maxr * 2).max(2)).next_power_of_two().trailing_zeros();
     let rsize = 1usize << rbits;
     let mut slots = vec![SLOT_EMPTY; rsize * NPART];
-    slots.par_chunks_mut(rsize).zip(interned.par_iter()).enumerate().for_each(|(b, (reg, x))| {
-        for (i, &k) in x.1.iter().enumerate() {
+    slots.par_chunks_mut(rsize).zip(ids.par_iter()).enumerate().for_each(|(b, (reg, x))| {
+        for (i, &k) in x.iter().enumerate() {
             let mut j = k.h() as usize & (rsize - 1);
             while reg[j].pid != NO_PID {
                 j = (j + 1) & (rsize - 1);
@@ -1402,11 +1453,16 @@ fn main() {
     );
     let ck_chunks = make_chunks(&ck_files, &["click_id", "user_id", "campaign_id", "ts"]);
 
-    // Links and event parsing are independent; dedup and clicks then need links.
+    // The link files are small: parse and intern them on the whole pool first.
+    // The rest of the link build runs alongside event parsing; dedup and
+    // clicks then need the links.
+    let tf = Instant::now();
+    let front = links_front(&ln_files);
+    prof(0, tf);
     let (links, ev_parsed) = rayon::join(
         || {
             let t = Instant::now();
-            let l = build_links(&ln_files);
+            let l = links_tail(front);
             prof(0, t);
             l
         },
