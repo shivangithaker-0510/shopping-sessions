@@ -6,6 +6,10 @@
 //! by hash partition (event id -> user id -> person), so every lookup table a
 //! worker touches is partition-local and cache-sized.
 
+#[cfg(windows)]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[cfg(target_os = "linux")]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -33,6 +37,9 @@ use xxhash_rust::xxh3::xxh3_128;
 
 /// Partition count (power of two) for hash-partitioned stages.
 const NPART: usize = 256;
+/// Default event-id partition count: few enough output streams per parse task
+/// to stay in L1, while dedup splits each partition further (see dedup_events).
+const EPART_DEFAULT: usize = 256;
 /// Target size of one parse task.
 const CHUNK: usize = 4 << 20;
 
@@ -361,7 +368,8 @@ fn read_small_table(path: &Path, wanted: &[&str]) -> Vec<[S; 2]> {
 }
 
 fn transpose<T>(v: Vec<Vec<Vec<T>>>) -> Vec<Vec<Vec<T>>> {
-    let mut out: Vec<Vec<Vec<T>>> = (0..NPART).map(|_| Vec::with_capacity(v.len())).collect();
+    let width = v.first().map_or(NPART, |t| t.len());
+    let mut out: Vec<Vec<Vec<T>>> = (0..width).map(|_| Vec::with_capacity(v.len())).collect();
     for t in v {
         for (p, x) in t.into_iter().enumerate() {
             out[p].push(x);
@@ -625,6 +633,8 @@ struct UCk {
 }
 
 struct Ctx {
+    /// Event-id partition count (power of two) for the parse -> dedup scatter.
+    epart: usize,
     ws: i64,
     /// Seconds origin of packed ingest_ts values.
     ingest_base: i64,
@@ -647,7 +657,8 @@ fn pack_ingest(ms: i64, base: i64) -> u32 {
 
 fn parse_events(c: &Chunk, ctx: &Ctx) -> Vec<Vec<Ev>> {
     let t = Instant::now();
-    let mut out: Vec<Vec<Ev>> = new_parts(c.data.len() / 72 / NPART + 4);
+    let emask = ctx.epart - 1;
+    let mut out: Vec<Vec<Ev>> = (0..ctx.epart).map(|_| Vec::with_capacity(c.data.len() / 72 / ctx.epart + 4)).collect();
     let m = c.map;
     let mut tc = TsCache::default();
     let exp = EXP.load(Relaxed);
@@ -704,7 +715,7 @@ fn parse_events(c: &Chunk, ctx: &Ctx) -> Vec<Vec<Ev>> {
             Some(x) => pack_ingest(x, ctx.ingest_base),
             None => u32::MAX,
         };
-        out[ek.part()].push(Ev { eid: ek, user, user_s: PS::new(user_s), ingest, ts, price, cat, kind });
+        out[(ek.1 >> 32) as usize & emask].push(Ev { eid: ek, user, user_s: PS::new(user_s), ingest, ts, price, cat, kind });
     });
     prof(1, t);
     out
@@ -752,18 +763,21 @@ fn dedup_events(mut parts: Vec<Vec<Ev>>, links: &Links) -> Vec<Vec<UEv>> {
     }
     // Split into SUB buckets by the key's top bits (streaming writes), then
     // dedup each bucket with a table small enough to stay in L2.
-    const SUB: usize = 16;
+    // About 4096 entries per bucket: a 64 KiB table, L2-resident.
+    let sub_bits = (n / 4096).max(1).next_power_of_two().trailing_zeros().min(12);
+    let sub = 1usize << sub_bits;
     DEDUP_TABLE.with(|cell| {
         let mut scratch = cell.borrow_mut();
         let (buckets, table) = &mut *scratch;
-        buckets.resize_with(SUB, Vec::new);
+        buckets.resize_with(sub, Vec::new);
+        buckets.truncate(sub);
         for b in buckets.iter_mut() {
             b.clear();
-            b.reserve(n / SUB + n / (SUB * 4) + 16);
+            b.reserve(n / sub + n / (sub * 4) + 16);
         }
         for (vi, v) in parts.iter().enumerate() {
             for (pi, e) in v.iter().enumerate() {
-                buckets[(e.eid.0 >> 60) as usize].push(DE { k0: e.eid.0, loc: (vi as u64) << 32 | pi as u64 });
+                buckets[if sub_bits == 0 { 0 } else { (e.eid.0 >> (64 - sub_bits)) as usize }].push(DE { k0: e.eid.0, loc: (vi as u64) << 32 | pi as u64 });
             }
         }
         for b in buckets.iter() {
@@ -1246,7 +1260,7 @@ fn main() {
             let mut z = 0i64;
             for c in &chunks { scan_rows::<7>(c.data, |f| { z += parse_ts(f[2]).unwrap_or(0) + parse_ts(f[3]).unwrap_or(0); }); }
             let c2 = t.elapsed();
-            let ctx = Ctx { ws: 0, ingest_base: 0, we: i64::MAX, products: HashMap::new(), campaigns: HashMap::new(), unknown_cat: 0, ncamp: 0, day0: 0, ndays: 1 };
+            let ctx = Ctx { epart: EPART_DEFAULT, ws: 0, ingest_base: 0, we: i64::MAX, products: HashMap::new(), campaigns: HashMap::new(), unknown_cat: 0, ncamp: 0, day0: 0, ndays: 1 };
             let t = Instant::now();
             let mut m = 0usize;
             for c in &chunks { m += parse_events(c, &ctx).iter().map(|v| v.len()).sum::<usize>(); }
@@ -1319,7 +1333,9 @@ fn main() {
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1).max(1) as usize;
     assert!(we - ws < (1i64 << 32), "window longer than 49 days is not supported");
     let ingest_base = ws.div_euclid(1000) - (1i64 << 31);
-    let ctx = Ctx { ws, ingest_base, we, products, campaigns, unknown_cat, ncamp: camp_rows.len() as u32, day0, ndays };
+    let epart: usize = std::env::var("SS_EPART").ok().and_then(|v| v.parse().ok()).unwrap_or(EPART_DEFAULT);
+    assert!(epart.is_power_of_two() && epart <= 1 << 16, "SS_EPART must be a power of two");
+    let ctx = Ctx { epart, ws, ingest_base, we, products, campaigns, unknown_cat, ncamp: camp_rows.len() as u32, day0, ndays };
     log!(t0, "dims: {} products, {} categories, {} campaigns", ctx.products.len(), cat_names.len(), ctx.ncamp);
 
     let ev_chunks = make_chunks(
