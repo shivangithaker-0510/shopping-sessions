@@ -290,10 +290,131 @@ impl Iterator for Structurals<'_> {
     }
 }
 
+/// Comma, quote and newline masks of the 64 bytes at `base` (bit k = byte
+/// base + k); bytes past the end are 0.
+#[inline(always)]
+fn block_masks(data: &[u8], base: usize) -> (u64, u64, u64) {
+    let len = data.len();
+    #[cfg(target_arch = "x86_64")]
+    if base + 64 <= len {
+        use std::arch::x86_64::*;
+        unsafe {
+            let p = data.as_ptr().add(base);
+            let c = _mm_set1_epi8(b',' as i8);
+            let q = _mm_set1_epi8(b'"' as i8);
+            let n = _mm_set1_epi8(b'\n' as i8);
+            let (mut mc, mut mq, mut mn) = (0u64, 0u64, 0u64);
+            for k in 0..4 {
+                let v = _mm_loadu_si128(p.add(16 * k) as *const __m128i);
+                mc |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, c)) as u32 as u64) << (16 * k);
+                mq |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, q)) as u32 as u64) << (16 * k);
+                mn |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, n)) as u32 as u64) << (16 * k);
+            }
+            return (mc, mq, mn);
+        }
+    }
+    let (mut mc, mut mq, mut mn) = (0u64, 0u64, 0u64);
+    let end = len.min(base + 64);
+    for (k, &b) in data[base..end].iter().enumerate() {
+        mc |= ((b == b',') as u64) << k;
+        mq |= ((b == b'"') as u64) << k;
+        mn |= ((b == b'\n') as u64) << k;
+    }
+    (mc, mq, mn)
+}
+
+/// Bits lo..hi-1 (0 <= lo <= hi <= 64).
+#[inline(always)]
+fn bit_range(lo: usize, hi: usize) -> u64 {
+    let h = if hi >= 64 { !0u64 } else { (1u64 << hi) - 1 };
+    let l = if lo >= 64 { !0u64 } else { (1u64 << lo) - 1 };
+    h & !l
+}
+
+/// A field that holds a quote: valid only as `"..."` wrapping the whole field
+/// with no other quote. Returns the unquoted value.
+#[inline(never)]
+fn quoted_field(f: S) -> Option<S> {
+    let n = f.len();
+    if n >= 2 && f[0] == b'"' && f[n - 1] == b'"' && memchr(b'"', &f[1..n - 1]).is_none() {
+        Some(&f[1..n - 1])
+    } else {
+        None
+    }
+}
+
 /// One SIMD pass over a chunk: calls `row` with the N unquoted fields of every
 /// well-formed line (rules.md "CSV dialect"); malformed lines are skipped.
+/// Only separators (`,` and `\n`) are visited; quotes are checked per field
+/// from the quote mask, so a field without quotes costs no extra work.
 #[inline(always)]
 fn scan_rows<const N: usize>(data: S, mut row: impl FnMut(&[S; N])) {
+    let mut fields: [S; N] = [&[]; N];
+    let mut nf = 0usize;
+    let mut bad = false;
+    let mut fs = 0usize; // current field start
+    let mut qpend = false; // a quote in the current field, in an earlier block
+    let mut line_start = 0usize;
+    let len = data.len();
+    let mut base = 0usize;
+    while base < len {
+        let (mc, mq, mn) = block_masks(data, base);
+        let mut sep = mc | mn;
+        let mut o = fs.saturating_sub(base); // field start offset in this block
+        while sep != 0 {
+            let p = sep.trailing_zeros() as usize;
+            sep &= sep - 1;
+            let pos = base + p;
+            if nf < N {
+                let f = &data[fs..pos];
+                if !qpend && mq & bit_range(o, p) == 0 {
+                    fields[nf] = f;
+                } else {
+                    match quoted_field(f) {
+                        Some(v) => fields[nf] = v,
+                        None => bad = true,
+                    }
+                }
+            }
+            nf += 1;
+            qpend = false;
+            if (mn >> p) & 1 != 0 {
+                if !bad && nf == N {
+                    row(&fields);
+                }
+                nf = 0;
+                bad = false;
+                line_start = pos + 1;
+            }
+            fs = pos + 1;
+            o = p + 1;
+        }
+        qpend |= mq & bit_range(o, 64) != 0;
+        base += 64;
+    }
+    if line_start < len {
+        if nf < N {
+            let f = &data[fs..len];
+            if !qpend && memchr(b'"', f).is_none() {
+                fields[nf] = f;
+            } else {
+                match quoted_field(f) {
+                    Some(v) => fields[nf] = v,
+                    None => bad = true,
+                }
+            }
+        }
+        nf += 1;
+        if !bad && nf == N {
+            row(&fields);
+        }
+    }
+}
+
+/// One SIMD pass over a chunk: calls `row` with the N unquoted fields of every
+/// well-formed line (rules.md "CSV dialect"); malformed lines are skipped.
+#[cfg(test)]
+fn scan_rows_ref<const N: usize>(data: S, mut row: impl FnMut(&[S; N])) {
     let mut fields: [S; N] = [&[]; N];
     let mut nf = 0usize;
     let mut bad = false;
@@ -646,8 +767,16 @@ fn pack_ingest(ms: i64, base: i64) -> u32 {
 }
 
 fn parse_events(c: &Chunk, ctx: &Ctx) -> Vec<Vec<Ev>> {
-    let t = Instant::now();
     let mut out: Vec<Vec<Ev>> = new_parts(c.data.len() / 72 / NPART + 4);
+    parse_events_into(c, ctx, &mut out);
+    out
+}
+
+fn parse_events_into(c: &Chunk, ctx: &Ctx, out: &mut [Vec<Ev>]) {
+    let t = Instant::now();
+    for v in out.iter_mut() {
+        v.clear();
+    }
     let m = c.map;
     let mut tc = TsCache::default();
     let exp = EXP.load(Relaxed);
@@ -656,7 +785,7 @@ fn parse_events(c: &Chunk, ctx: &Ctx) -> Vec<Vec<Ev>> {
         scan_rows::<7>(c.data, |f| n += f[0].len());
         std::hint::black_box(n);
         prof(1, t);
-        return out;
+        return;
     }
     scan_rows::<7>(c.data, |f| {
         let eid = f[m[0] as usize];
@@ -707,7 +836,6 @@ fn parse_events(c: &Chunk, ctx: &Ctx) -> Vec<Vec<Ev>> {
         out[ek.part()].push(Ev { eid: ek, user, user_s: PS::new(user_s), ingest, ts, price, cat, kind });
     });
     prof(1, t);
-    out
 }
 
 /// One dedup table entry: the low 64 bits of an event-id key and where the
@@ -1275,6 +1403,7 @@ fn main() {
     let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("read manifest.json");
     let ws = manifest_ts(&manifest, "window_start");
     let we = manifest_ts(&manifest, "window_end");
+    init_dates(ws);
     log!(t0, "window {ws}..{we}, {threads} threads");
 
     // Map every input file (readahead starts immediately).
@@ -1327,6 +1456,23 @@ fn main() {
         &["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"],
     );
     let ck_chunks = make_chunks(&ck_files, &["click_id", "user_id", "campaign_id", "ts"]);
+
+    // In-process single-thread parse benchmark (SS_PARSEBENCH=rounds): output
+    // buffers are reused, so rounds after the first measure parse CPU only.
+    if let Some(rounds) = std::env::var("SS_PARSEBENCH").ok().and_then(|v| v.parse::<usize>().ok()) {
+        let mut outs: Vec<Vec<Vec<Ev>>> = ev_chunks.iter().map(|c| new_parts(c.data.len() / 72 / NPART + 4)).collect();
+        let rows: usize = ev_chunks.iter().map(|c| c.data.len()).sum();
+        for r in 0..rounds {
+            let t = Instant::now();
+            for (c, o) in ev_chunks.iter().zip(outs.iter_mut()) {
+                parse_events_into(c, &ctx, o);
+            }
+            let n: usize = outs.iter().map(|o| o.iter().map(|v| v.len()).sum::<usize>()).sum();
+            eprintln!("parsebench round {r}: {:.3}s {} rows {:.1} ns/row {:.0} MB/s", t.elapsed().as_secs_f64(), n,
+                t.elapsed().as_nanos() as f64 / n.max(1) as f64, rows as f64 / t.elapsed().as_secs_f64() / 1e6);
+        }
+        std::process::exit(0);
+    }
 
     // Links and event parsing are independent; dedup and clicks then need links.
     let (links, ev_parsed) = rayon::join(
@@ -1404,6 +1550,33 @@ mod tests {
         let mut v = Vec::new();
         scan_rows::<N>(s, |f| v.push(f.to_vec()));
         v
+    }
+
+    #[test]
+    fn scanner_matches_reference() {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let alphabet = b"ab,\",\n\"x \r1";
+        for round in 0..300_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let len = (seed % 200) as usize + (round % 3) * 60;
+            let mut v = Vec::with_capacity(len);
+            let mut z = seed;
+            for _ in 0..len {
+                z = z.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                v.push(alphabet[(z >> 59) as usize % alphabet.len()]);
+            }
+            let v: &'static [u8] = Box::leak(v.into_boxed_slice());
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            scan_rows::<3>(v, |f| a.push(f.to_vec()));
+            scan_rows_ref::<3>(v, |f| b.push(f.to_vec()));
+            assert_eq!(a, b, "{:?}", String::from_utf8_lossy(v));
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            scan_rows::<1>(v, |f| a.push(f.to_vec()));
+            scan_rows_ref::<1>(v, |f| b.push(f.to_vec()));
+            assert_eq!(a, b, "{:?}", String::from_utf8_lossy(v));
+        }
     }
 
     #[test]

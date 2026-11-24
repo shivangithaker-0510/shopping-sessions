@@ -196,62 +196,110 @@ fn civil_days(s: &[u8]) -> Option<i64> {
     Some(days_from_civil(year, month, day))
 }
 
-const TC_SLOTS: usize = 64;
+/// Valid calendar dates of a few years as a direct table: entry
+/// `((year - base) * 12 + month - 1) * 32 + day` holds the day number since
+/// the epoch, or `NO_DATE` for an impossible date. Years outside the table
+/// fall back to `civil_days`.
+pub struct DateTable {
+    base: i64,
+    years: i64,
+    days: Vec<i32>,
+}
 
-/// Direct-mapped cache of validated dates (the 10 bytes `YYYY-MM-DD` packed
-/// into a u128 key), so the calendar math runs once per distinct date and
-/// slot. Only valid dates are cached; results are identical to `parse_ts`.
+const NO_DATE: i32 = i32::MIN;
+
+impl DateTable {
+    pub fn new(base: i64, years: i64) -> DateTable {
+        let mut days = vec![NO_DATE; (years * 12 * 32) as usize];
+        for y in base..base + years {
+            for m in 1..=12 {
+                for d in 0..32 {
+                    let s = format!("{:04}-{:02}-{:02}", y, m, d);
+                    if let Some(v) = civil_days(s.as_bytes()) {
+                        days[(((y - base) * 12 + m - 1) * 32 + d) as usize] = v as i32;
+                    }
+                }
+            }
+        }
+        DateTable { base, years, days }
+    }
+}
+
+static DATES: std::sync::OnceLock<DateTable> = std::sync::OnceLock::new();
+
+/// Sets the years the date table covers (call once, before parsing).
+pub fn init_dates(window_start_ms: i64) {
+    let year = 1970 + window_start_ms.div_euclid(DAY) * 400 / 146_097;
+    let _ = DATES.set(DateTable::new(year - 2, 5));
+}
+
+fn dates() -> &'static DateTable {
+    DATES.get_or_init(|| DateTable::new(2024, 6))
+}
+
+/// Byte k of `v` is an ASCII digit for every k set in `m` (0xFF per byte).
+#[inline(always)]
+fn digits_at(v: u64, m: u64) -> bool {
+    let hi = v & (m & 0xF0F0_F0F0_F0F0_F0F0);
+    let d = v.wrapping_sub(0x3030_3030_3030_3030 & m) & m;
+    hi == (0x3030_3030_3030_3030 & m) && (d.wrapping_add(0x0606_0606_0606_0606 & m) & (m & 0xF0F0_F0F0_F0F0_F0F0)) == 0
+}
+
+/// F1/F2 date-time parser. `s.len() >= 20` and `s[19]` is checked by the caller.
 pub struct TsCache {
-    keys: [u128; TC_SLOTS],
-    days: [i64; TC_SLOTS],
+    table: &'static DateTable,
 }
 
 impl Default for TsCache {
     fn default() -> Self {
-        TsCache { keys: [u128::MAX; TC_SLOTS], days: [0; TC_SLOTS] }
+        TsCache { table: dates() }
     }
 }
 
 impl TsCache {
     #[inline(always)]
     fn civil_ms(&mut self, s: &[u8]) -> Option<i64> {
-        // s.len() >= 20 here.
-        if s[10] != b'T' {
+        let a = u64::from_le_bytes(s[0..8].try_into().unwrap()); // YYYY-MM-
+        let b = u64::from_le_bytes(s[8..16].try_into().unwrap()); // DDTHH:MM
+        let c = u32::from_le_bytes(s[16..20].try_into().unwrap()); // :SS?
+        // Separators: a[4]='-', a[7]='-', b[2]='T', b[5]=':', c[0]=':'.
+        const AM: u64 = 0xFF00_00FF_0000_0000;
+        const AV: u64 = 0x2D00_002D_0000_0000;
+        const BM: u64 = 0x0000_FF00_00FF_0000;
+        const BV: u64 = 0x0000_3A00_0054_0000;
+        if a & AM != AV || b & BM != BV || c as u8 != b':' {
             return None;
         }
-        let lo = u64::from_le_bytes(s[0..8].try_into().unwrap());
-        let hi = u16::from_le_bytes([s[8], s[9]]);
-        let key = (lo as u128) | ((hi as u128) << 64);
-        // Month and day bytes, mixed so every distinct date in a window spreads.
-        let h = ((lo >> 40) ^ ((hi as u64) << 24)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let slot = (h >> 58) as usize & (TC_SLOTS - 1);
-        let days = if self.keys[slot] == key {
-            self.days[slot]
-        } else {
-            let d = civil_days(s)?;
-            self.keys[slot] = key;
-            self.days[slot] = d;
-            d
-        };
-        // "HH:MM:SS" as one u64: check the colons, then the six digits.
-        let t = u64::from_le_bytes(s[11..19].try_into().unwrap());
-        if (t >> 16) as u8 != b':' || (t >> 40) as u8 != b':' {
+        // Digits: a bytes 0-3,5,6; b bytes 0,1,3,4,6,7; c bytes 1,2.
+        if !digits_at(a, 0x00FF_FF00_FFFF_FFFF) || !digits_at(b, 0xFFFF_00FF_FF00_FFFF) {
             return None;
         }
-        let dg = t.wrapping_sub(0x3030_0030_3000_3030) & !0x0000_FF00_00FF_0000;
-        // Each digit byte must be 0..=9.
-        if (t & 0xF0F0_00F0_F000_F0F0) != 0x3030_0030_3000_3030
-            || (dg.wrapping_add(0x0606_0006_0600_0606) & 0xF0F0_00F0_F000_F0F0) != 0
-        {
+        let c1 = ((c >> 8) as u8).wrapping_sub(b'0');
+        let c2 = ((c >> 16) as u8).wrapping_sub(b'0');
+        if c1 > 9 || c2 > 9 {
             return None;
         }
-        let b = |k: u32| ((dg >> (8 * k)) & 0xFF) as i64;
-        let hour = b(0) * 10 + b(1);
-        let minute = b(3) * 10 + b(4);
-        let second = b(6) * 10 + b(7);
+        let byte = |v: u64, k: u32| ((v >> (8 * k)) & 0xFF) as i64 - b'0' as i64;
+        let year = byte(a, 0) * 1000 + byte(a, 1) * 100 + byte(a, 2) * 10 + byte(a, 3);
+        let month = byte(a, 5) * 10 + byte(a, 6);
+        let day = byte(b, 0) * 10 + byte(b, 1);
+        let hour = byte(b, 3) * 10 + byte(b, 4);
+        let minute = byte(b, 6) * 10 + byte(b, 7);
+        let second = c1 as i64 * 10 + c2 as i64;
         if hour > 23 || minute > 59 || second > 59 {
             return None;
         }
+        let t = self.table;
+        let y = year - t.base;
+        let days = if (0..t.years).contains(&y) && (1..=12).contains(&month) && day < 32 {
+            let v = t.days[((y * 12 + month - 1) * 32 + day) as usize];
+            if v == NO_DATE {
+                return None;
+            }
+            v as i64
+        } else {
+            civil_days(s)?
+        };
         Some(days * DAY + hour * 3_600_000 + minute * 60_000 + second * 1_000)
     }
 
